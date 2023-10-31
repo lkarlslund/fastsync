@@ -13,12 +13,6 @@ import (
 	"github.com/lkarlslund/gonk"
 )
 
-type QueueItem struct {
-	Command  string
-	Path     string
-	FileInfo FileInfo
-}
-
 type filehandleindex struct {
 	name string
 	fh   *os.File
@@ -55,12 +49,16 @@ type FileInfo struct {
 }
 
 type FileListResponse struct {
-	Files []FileInfo
+	ParentFolder string
+	Files        []FileInfo
 }
 
 func (s *Server) Listfiles(path string, reply *FileListResponse) error {
 	logger.Trace().Msgf("Listing files in %s", path)
+
 	var flr FileListResponse
+	flr.ParentFolder = path
+
 	entries, err := os.ReadDir(filepath.Join(s.BasePath, path))
 	if err != nil {
 		return err
