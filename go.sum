@@ -1,7 +1,11 @@
+github.com/akihirosuda/x-sys-unix-auto-eintr v0.0.0-20200303093320-a5fb09464fb2 h1:q8YUE05+D+Rw8yEDIdfQbybZVhj4K/pUb9Dp3EtMbGY=
+github.com/akihirosuda/x-sys-unix-auto-eintr v0.0.0-20200303093320-a5fb09464fb2/go.mod h1:97OtHq6pMwXiTGOJxMEdp/SJhnMASPAA8OnNmQZa6a8=
 github.com/cespare/xxhash/v2 v2.2.0 h1:DC2CZ1Ep5Y4k3ZQ899DldepgrayRUGE6BBZ/cd9Cj44=
 github.com/cespare/xxhash/v2 v2.2.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/coreos/go-systemd/v22 v22.5.0/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
 github.com/godbus/dbus/v5 v5.0.4/go.mod h1:xhWf0FNVPg57R7Z0UbKHbJfkEywrmjJnf7w5xrFpKfA=
+github.com/joshlf/go-acl v0.0.0-20200411065538-eae00ae38531 h1:hgVxRoDDPtQE68PT4LFvNlPz2nBKd3OMlGKIQ69OmR4=
+github.com/joshlf/go-acl v0.0.0-20200411065538-eae00ae38531/go.mod h1:fqTUQpVYBvhCNIsMXGl2GE9q6z94DIP6NtFKXCSTVbg=
 github.com/klauspost/compress v1.17.2 h1:RlWWUY/Dr4fL8qk9YG7DTZ7PDgME2V4csBXA8L/ixi4=
 github.com/klauspost/compress v1.17.2/go.mod h1:ntbaceVETuRiXiv4DpjP66DpAtAGkEQskQzEyD//IeE=
 github.com/lkarlslund/gonk v0.0.0-20230414120804-21c23f637b3d h1:nKfud/iW61+hUZrCb9eH4P0Ms4BqbCL6MrhhU82MPZI=

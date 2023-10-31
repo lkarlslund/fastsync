@@ -1,7 +1,6 @@
 package main
 
 import (
-	"io"
 	"io/fs"
 	"net"
 	"net/rpc"
@@ -13,11 +12,14 @@ import (
 	"syscall"
 	"time"
 
+	wunix "github.com/akihirosuda/x-sys-unix-auto-eintr"
 	"github.com/cespare/xxhash/v2"
+	"github.com/joshlf/go-acl"
 	"github.com/lkarlslund/gonk"
 	"github.com/rs/zerolog"
 	"github.com/spf13/pflag"
 	"github.com/ugorji/go/codec"
+	unix "golang.org/x/sys/unix"
 )
 
 var logger zerolog.Logger
@@ -35,6 +37,14 @@ func main() {
 	loglevel := pflag.String("loglevel", "info", "Log level")
 	pflag.Parse()
 
+	var err error
+	if *folder == "." {
+		*folder, err = os.Getwd()
+		if err != nil {
+			logger.Fatal().Msgf("Error getting working directory: %v", err)
+		}
+	}
+
 	var zll zerolog.Level
 	switch strings.ToLower(*loglevel) {
 	case "trace":
@@ -50,7 +60,7 @@ func main() {
 	default:
 		logger.Fatal().Msgf("Invalid log level: %v", *loglevel)
 	}
-	logger.Level(zll)
+	logger = logger.Level(zll)
 
 	var h codec.MsgpackHandle
 
@@ -67,19 +77,20 @@ func main() {
 		}
 		err := server.Register(serverobject)
 		if err != nil {
-			panic(err)
+			logger.Fatal().Msgf("Error registering server object: %v", err)
 		}
 
 		listener, err := net.Listen("tcp", *bind)
 		if err != nil {
-			panic(err)
+			logger.Fatal().Msgf("Error binding listener: %v", err)
 		}
 		logger.Info().Msgf("Listening on %s", *bind)
 		for {
 			conn, err := listener.Accept()
 			logger.Info().Msgf("Accepted connection from %v", conn.RemoteAddr())
 			if err != nil {
-				panic(err)
+				logger.Error().Msgf("Error accepting connection: %v", err)
+				continue
 			}
 			go func() {
 				server.ServeCodec(codec.GoRpc.ServerCodec(CompressedReadWriteCloser(conn), &h))
@@ -90,7 +101,7 @@ func main() {
 		//RPC Communication (client side)
 		conn, err := net.Dial("tcp", *bind)
 		if err != nil {
-			panic(err)
+			logger.Fatal().Msgf("Error connecting to %s: %v", *bind, err)
 		}
 		logger.Info().Msgf("Connected to %s", *bind)
 
@@ -122,11 +133,13 @@ func main() {
 							continue
 						}
 						for _, fi := range filelistresponse.Files {
+							localpath = filepath.Join(*folder, fi.Name)
 							logger.Trace().Msgf("Found file %s", fi.Name)
 							if fi.IsDir {
-								err = os.MkdirAll(filepath.Dir(localpath), 0755)
+								logger.Trace().Msgf("Creating directory %s", localpath)
+								err = os.MkdirAll(filepath.Join(*folder, fi.Name), 0755)
 								if err != nil {
-									logger.Error().Msgf("Error creating directory %v: %v", filepath.Dir(localpath), err)
+									logger.Error().Msgf("Error creating directory %v: %v", localpath, err)
 									continue
 								}
 
@@ -139,7 +152,7 @@ func main() {
 								queue <- QueueItem{
 									Command:  "processfile",
 									Path:     fi.Name,
-									FileInfo: &fi,
+									FileInfo: fi,
 								}
 							}
 						}
@@ -149,17 +162,19 @@ func main() {
 
 						remotefi := item.FileInfo
 
-						exists := true    // do we have it locally
-						copyfile := false // do we need to copy it
-						changed := false  // do we need to update owner etc.
+						exists := true // do we have it locally
+						create_file := false
+						copy_verify_file := false // do we need to copy it
+						apply_attributes := false // do we need to update owner etc.
 
-						localfi, err := os.Stat(localpath)
+						localfi, err := os.Lstat(localpath)
 						if err != nil {
 							if os.IsNotExist(err) {
 								logger.Trace().Msgf("File %s does not exist", localpath)
 								exists = false
 							} else {
-								panic(err)
+								logger.Error().Msgf("Error getting stat stat for local path %s: %v", localpath, err)
+								continue
 							}
 						}
 
@@ -168,41 +183,67 @@ func main() {
 							var ok bool
 							localstat, ok := localfi.Sys().(*syscall.Stat_t)
 							if !ok {
-								logger.Fatal().Msgf("Could not obtain local stat for %s", localpath)
+								logger.Error().Msgf("Could not obtain local native stat for %s", localpath)
+								continue
 							}
 
-							if localfi.Mode()&fs.ModeType != remotefi.Mode&fs.ModeType {
-								logger.Debug().Msgf("File %s is indicating type change, unlinking", localpath)
+							if localstat.Mode&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
+								logger.Debug().Msgf("File %s is indicating type change from %X to %X, unlinking", localpath, localstat.Mode&^uint32(os.ModePerm), remotefi.Permissions&^uint32(os.ModePerm))
 								err = os.Remove(localpath)
 								if err != nil {
 									logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
+									continue
 								}
-								copyfile = true
+
+								create_file = true
+								apply_attributes = true
 								exists = false
 							} else {
-								localmtime := time.Unix(localstat.Mtim.Sec, localstat.Mtim.Nsec)
-								if *checksum || localfi.Size() != remotefi.Size || localfi.Mode() != remotefi.Mode ||
-									localstat.Uid != remotefi.Owner || localstat.Gid != remotefi.Group ||
-									localmtime.Compare(remotefi.ModifyTime) != 0 {
-									logger.Debug().Msgf("File %s is indicating changes", localpath)
-									changed = true
-									copyfile = true
+								if localfi.Size() > remotefi.Size && remotefi.Mode&fs.ModeSymlink == 0 {
+									logger.Debug().Msgf("File %s is indicating size change from %v to %v, truncating", localpath, localfi.Size(), remotefi.Size)
+									err = os.Truncate(localpath, int64(remotefi.Size))
+									if err != nil {
+										logger.Error().Msgf("Error truncating %s to %v bytes to match remote: %v", localpath, remotefi.Size, err)
+										continue
+									}
+									apply_attributes = true
+								}
+
+								if localstat.Mtim.Nano() != remotefi.Mtim.Nano() {
+									logger.Debug().Msgf("File %s is indicating time change from %v to %v, applying attribute changes", localpath, time.Unix(0, localstat.Mtim.Nano()), time.Unix(0, remotefi.Mtim.Nano()))
+									apply_attributes = true
+								}
+
+								if localfi.Mode().Perm() != remotefi.Mode.Perm() || localstat.Uid != remotefi.Owner || localstat.Gid != remotefi.Group {
+									logger.Debug().Msgf("File %s is indicating permissions changes, applying attribute changes", localpath)
+									apply_attributes = true
+								}
+
+								if remotefi.Size > 0 && remotefi.Mode&fs.ModeSymlink == 0 && (apply_attributes || *checksum) {
+									logger.Debug().Msgf("File %s is indicating size changes, remote size is %v", localpath, remotefi.Size)
+									copy_verify_file = true
 								}
 							}
 						} else {
 							// Not existing
-							copyfile = true
-							if *hardlinks && item.FileInfo.Nlink > 1 {
+							if !*hardlinks || item.FileInfo.Nlink == 1 {
+								create_file = true
+								if remotefi.Size > 0 {
+									copy_verify_file = true
+								}
+								apply_attributes = true
+							} else {
 								if ini, found := inodes.Load(inodeinfo{
 									inode: item.FileInfo.Inode,
 								}); found {
-									logger.Debug().Msgf("Hardlinking %s to %s", localpath, ini.path)
 									err = os.Link(filepath.Join(ini.path), localpath)
 									if err != nil {
-										panic(err)
+										logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.path, err)
+										continue
 									}
-									copyfile = false
-									changed = true
+									create_file = false
+									copy_verify_file = false
+									apply_attributes = true
 
 									// handle inode counters
 									nukeit := false
@@ -220,13 +261,47 @@ func main() {
 								}
 							}
 						}
+						transfersuccess := true
 
-						if copyfile {
+						var localfile *os.File
+						if create_file {
+							if remotefi.Mode&fs.ModeDevice != 0 {
+								if remotefi.Mode&fs.ModeCharDevice != 0 {
+									err = syscall.Mknod(localpath, syscall.S_IFCHR, int(remotefi.Rdev))
+									if err != nil {
+										logger.Error().Msgf("Error creating char device %s: %v", localpath, err)
+										continue
+									}
+								} else {
+									// Block device
+									err = syscall.Mknod(localpath, syscall.S_IFBLK, int(remotefi.Rdev))
+									if err != nil {
+										logger.Error().Msgf("Error creating block device %s: %v", localpath, err)
+										continue
+									}
+								}
+							} else if remotefi.Mode&fs.ModeSymlink != 0 {
+								err = syscall.Symlink(remotefi.LinkTo, localpath)
+								if err != nil {
+									logger.Error().Msgf("Error creating symlink from %s to %s: %v", localpath, remotefi.LinkTo, err)
+									continue
+								}
+							} else {
+								localfile, err = os.Create(localpath)
+								if err != nil {
+									logger.Error().Msgf("Error creating local file %s: %v", localpath, err)
+									continue
+								}
+							}
+						}
+
+						if copy_verify_file {
 							// file exists but is different, copy it
 							logger.Trace().Msgf("Processing blocks for %s", item.Path)
-							var localfile *os.File
 							var existingsize int64
-							if exists {
+
+							// Open file if we didn't create it earlier
+							if localfile == nil {
 								localfile, err = os.OpenFile(localpath, os.O_RDWR, fs.FileMode(remotefi.Mode))
 								if err != nil {
 									logger.Error().Msgf("Error opening existing local file %s: %v", localpath, err)
@@ -234,26 +309,6 @@ func main() {
 								}
 								fi, _ := os.Stat(localpath)
 								existingsize = fi.Size()
-							} else {
-								if remotefi.Mode&fs.ModeDevice != 0 {
-									err = syscall.Mknod(localpath, uint32(remotefi.Mode), int(remotefi.Rdev))
-									if err != nil {
-										logger.Error().Msgf("Error creating char device %s: %v", localpath, err)
-									}
-									continue
-								} else if remotefi.Mode&fs.ModeSymlink != 0 {
-									err = os.Symlink(remotefi.LinkTo, localpath)
-									if err != nil {
-										logger.Error().Msgf("Error creating symlink %s: %v", localpath, err)
-									}
-									continue
-								} else {
-									localfile, err = os.Create(localpath)
-								}
-							}
-							if err != nil {
-								logger.Error().Msgf("Error accessing local file %s: %v", localpath, err)
-								continue
 							}
 
 							if *hardlinks && item.FileInfo.Nlink > 1 {
@@ -267,10 +322,16 @@ func main() {
 
 							err = client.Call("Server.Open", item.Path, nil)
 							if err != nil {
-								panic(err)
+								logger.Error().Msgf("Error opening remote file %s: %v", item.Path, err)
+								logger.Error().Msgf("Item fileinfo: %+v", item.FileInfo)
+								break
 							}
 
 							for i := int64(0); i < remotefi.Size; i += 1000000 {
+								if !transfersuccess {
+									break // we couldn't open the remote file
+								}
+
 								// Read the chunk
 								length := int64(1000000)
 								if i+length > remotefi.Size {
@@ -285,13 +346,15 @@ func main() {
 									var hash uint64
 									err = client.Call("Server.ChecksumChunk", chunkArgs, &hash)
 									if err != nil {
-										panic(err)
+										logger.Error().Msgf("Error getting remote checksum for file %s chunk at %d: %v", item.Path, i, err)
+										transfersuccess = false
 									}
 									localdata := make([]byte, length)
 									n, err := localfile.ReadAt(localdata, i)
 									if err != nil {
-										logger.Error().Msgf("Error reading existing local file %s: %v", localpath, err)
-										continue
+										logger.Error().Msgf("Error reading existing local file %s chunk at %d: %v", localpath, i, err)
+										transfersuccess = false
+										break
 									}
 									if n == int(length) {
 										localhash := xxhash.Sum64(localdata)
@@ -306,42 +369,52 @@ func main() {
 								logger.Trace().Msgf("Transferring file %s chunk at %d", item.Path, i)
 								err = client.Call("Server.GetChunk", chunkArgs, &data)
 								if err != nil {
-									panic(err)
+									logger.Error().Msgf("Error transferring file %s chunk at %d: %v", item.Path, i, err)
+									transfersuccess = false
+									break
 								}
-								_, err = localfile.Seek(i, io.SeekStart)
+								n, err := localfile.WriteAt(data, i)
 								if err != nil {
-									panic(err)
-								}
-								n, err := localfile.Write(data)
-								if err != nil {
-									panic(err)
+									logger.Error().Msgf("Error writing to local file %s chunk at %d: %v", localpath, i, err)
+									transfersuccess = false
+									break
 								}
 								if n != int(length) {
-									logger.Fatal().Msgf("Wrote %v bytes but expected to write %v", n, length)
-									panic(err)
+									logger.Error().Msgf("Wrote %v bytes but expected to write %v", n, length)
+									transfersuccess = false
+									break
 								}
-								changed = true
+								apply_attributes = true
 							}
-							localfile.Close()
 							err = client.Call("Server.Close", item.Path, nil)
 							if err != nil {
-								panic(err)
+								logger.Error().Msgf("Error closing remote file %s: %v", item.Path, err)
 							}
 						}
+						if localfile != nil {
+							localfile.Close()
+						}
 
-						if changed {
+						if apply_attributes && transfersuccess {
 							logger.Debug().Msgf("Updating metadata for %s", item.Path)
-							err = os.Chown(localpath, int(remotefi.Owner), int(remotefi.Group))
+							err = os.Lchown(localpath, int(remotefi.Owner), int(remotefi.Group))
 							if err != nil {
-								panic(err)
+								logger.Error().Msgf("Error changing owner for %s: %v", localpath, err)
 							}
-							err = os.Chmod(localpath, fs.FileMode(remotefi.Mode))
-							if err != nil {
-								panic(err)
+							if remotefi.Mode&fs.ModeSymlink == 0 {
+								err = os.Chmod(localpath, fs.FileMode(remotefi.Permissions))
+								if err != nil {
+									logger.Error().Msgf("Error changing mode for %s: %v", localpath, err)
+								}
+								err = acl.Set(localpath, remotefi.ACL)
+								if err != nil {
+									logger.Error().Msgf("Error setting ACL for %s: %v", localpath, err)
+								}
 							}
-							err = os.Chtimes(localpath, remotefi.AccessTime, remotefi.ModifyTime)
+
+							err = wunix.UtimesNanoAt(unix.AT_FDCWD, localpath, []unix.Timespec{unix.Timespec(remotefi.Atim), unix.Timespec(remotefi.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
 							if err != nil {
-								panic(err)
+								logger.Error().Msgf("Error changing times for %s: %v", localpath, err)
 							}
 						}
 					default:

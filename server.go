@@ -7,16 +7,16 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"github.com/joshlf/go-acl"
 	"github.com/lkarlslund/gonk"
 )
 
 type QueueItem struct {
 	Command  string
 	Path     string
-	FileInfo *FileInfo
+	FileInfo FileInfo
 }
 
 type filehandleindex struct {
@@ -37,15 +37,21 @@ type Server struct {
 
 type FileInfo struct {
 	Name  string
-	Mode  fs.FileMode
+	Mode  fs.FileMode // Go simplified file type, not for chmod
 	Size  int64
 	IsDir bool
 
-	Owner, Group                       uint32
-	Inode, Nlink                       uint64
-	Dev, Rdev                          uint64
-	ModifyTime, AccessTime, CreateTime time.Time
-	LinkTo                             string
+	Permissions uint32
+	ACL         acl.ACL
+
+	Owner, Group uint32
+	Inode, Nlink uint64
+	Dev, Rdev    uint64
+	LinkTo       string
+
+	Atim syscall.Timespec
+	Mtim syscall.Timespec
+	Ctim syscall.Timespec
 }
 
 type FileListResponse struct {
@@ -60,17 +66,20 @@ func (s *Server) Listfiles(path string, reply *FileListResponse) error {
 		return err
 	}
 	for _, d := range entries {
+		absolutepath := filepath.Join(s.BasePath, path, d.Name())
+		relativepath := filepath.Join(path, d.Name())
+		// info, err := os.Lstat(absolutepath)
 		info, err := d.Info()
 		if err != nil {
 			return err
 		}
 		logger.Trace().Msgf("Found file %s", d.Name())
 		fi := FileInfo{
-			Name:       filepath.Join(path, d.Name()),
-			Mode:       info.Mode(),
-			Size:       info.Size(),
-			IsDir:      info.IsDir(),
-			ModifyTime: info.ModTime(),
+			Name:  relativepath,
+			Mode:  info.Mode(),
+			Size:  info.Size(),
+			IsDir: info.IsDir(),
+			// ModifyTime: info.ModTime(),
 		}
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 			fi.Inode = stat.Ino
@@ -79,40 +88,45 @@ func (s *Server) Listfiles(path string, reply *FileListResponse) error {
 			fi.Rdev = stat.Rdev
 			fi.Owner = stat.Uid
 			fi.Group = stat.Gid
+			fi.Permissions = stat.Mode
 
-			fi.AccessTime = time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
-			fi.CreateTime = time.Unix(stat.Ctim.Sec, stat.Ctim.Nsec)
-			fi.ModifyTime = time.Unix(stat.Mtim.Sec, stat.Mtim.Nsec)
+			fi.Atim = stat.Atim
+			fi.Mtim = stat.Mtim
+			fi.Ctim = stat.Ctim
 
-			switch stat.Mode {
-			case syscall.S_IFBLK:
-				logger.Debug().Msgf("Detected %v as block device", fi.Name)
-				var linkto []byte
-				_, err := syscall.Readlink(fi.Name, linkto)
+			if fi.Mode&os.ModeSymlink != 0 {
+				logger.Debug().Msgf("Detected %v as symlink", fi.Name)
+				// Symlink - read link and store in fi variable
+				linkto := make([]byte, 65536)
+				n, err := syscall.Readlink(absolutepath, linkto)
 				if err != nil {
 					logger.Error().Msgf("Error reading link to %v: %v", fi.Name, err)
+				} else {
+					logger.Debug().Msgf("Detected %v as symlink to %v", fi.Name, string(linkto))
 				}
-				fi.LinkTo = string(linkto)
-			case syscall.S_IFCHR:
+				fi.LinkTo = string(linkto[0:n])
+			} else if fi.Mode&os.ModeCharDevice != 0 && fi.Mode&os.ModeDevice != 0 {
 				logger.Debug().Msgf("Detected %v as character device", fi.Name)
-
-			case syscall.S_IFDIR:
-				// Directory - no special handling
-			case syscall.S_IFIFO:
-				logger.Debug().Msgf("Detected %v as FIFO device", fi.Name)
-			case syscall.S_IFLNK:
-				// Symlink - read link and store in fi variable
-
-			case syscall.S_IFMT:
-				logger.Debug().Msgf("Detected %v as mount point", fi.Name)
-			case syscall.S_IFREG:
-				// Regular file - no special handling
-			case syscall.S_IFSOCK:
-				// Unsupported
-				logger.Debug().Msgf("Detected %v as SOCKET device", fi.Name)
+			} else if fi.Mode&os.ModeDir != 0 {
+				logger.Debug().Msgf("Detected %v as directory", fi.Name)
+			} else if fi.Mode&os.ModeSocket != 0 {
+				logger.Debug().Msgf("Detected %v as socket", fi.Name)
+			} else if fi.Mode&os.ModeNamedPipe != 0 {
+				logger.Debug().Msgf("Detected %v as FIFO", fi.Name)
+			} else if fi.Mode&os.ModeDevice != 0 {
+				logger.Debug().Msgf("Detected %v as device", fi.Name)
+			} else {
+				logger.Debug().Msgf("Detected %v as regular file", fi.Name)
 			}
 		} else {
 			return fmt.Errorf("Stat failed, I got a %T", info.Sys())
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			acl, err := acl.Get(absolutepath)
+			if err != nil {
+				logger.Warn().Msgf("Failed to get ACL for file %v: %v", relativepath, err)
+			}
+			fi.ACL = acl
 		}
 		flr.Files = append(flr.Files, fi)
 	}
