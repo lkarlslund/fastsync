@@ -6,6 +6,7 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 
 	wunix "github.com/akihirosuda/x-sys-unix-auto-eintr"
 	"github.com/cespare/xxhash/v2"
+	"github.com/dustin/go-humanize"
 	"github.com/joshlf/go-acl"
 	"github.com/lkarlslund/gonk"
 	"github.com/rs/zerolog"
@@ -92,8 +94,11 @@ func main() {
 				logger.Error().Msgf("Error accepting connection: %v", err)
 				continue
 			}
+			wconn := NewPerformanceWrapper(conn, p.GetAtomicAdder(RecievedOverWire), p.GetAtomicAdder(SentOverWire))
+			cconn := CompressedReadWriteCloser(wconn)
+			wcconn := NewPerformanceWrapper(cconn, p.GetAtomicAdder(RecievedBytes), p.GetAtomicAdder(SentBytes))
 			go func() {
-				server.ServeCodec(codec.GoRpc.ServerCodec(CompressedReadWriteCloser(conn), &h))
+				server.ServeCodec(codec.GoRpc.ServerCodec(wcconn, &h))
 				logger.Info().Msgf("Closed connection from %v", conn.RemoteAddr())
 			}()
 		}
@@ -107,9 +112,13 @@ func main() {
 
 		// Start the process
 		filequeue := make(chan FileInfo, 32768)
-		folderqueue := make(chan FileInfo, 32768)
+		folderqueue := make(chan FileInfo, 16*1024*1024)
 
-		rpcCodec := codec.GoRpc.ClientCodec(CompressedReadWriteCloser(conn), &h)
+		wconn := NewPerformanceWrapper(conn, p.GetAtomicAdder(RecievedOverWire), p.GetAtomicAdder(SentOverWire))
+		cconn := CompressedReadWriteCloser(wconn)
+		wcconn := NewPerformanceWrapper(cconn, p.GetAtomicAdder(RecievedBytes), p.GetAtomicAdder(SentBytes))
+
+		rpcCodec := codec.GoRpc.ClientCodec(wcconn, &h)
 		client := rpc.NewClientWithCodec(rpcCodec)
 
 		var inodes gonk.Gonk[inodeinfo]
@@ -127,7 +136,7 @@ func main() {
 
 					var filelistresponse FileListResponse
 					err := client.Call("Server.Listfiles", item.Name, &filelistresponse)
-					logger.Trace().Msgf("Listfiles response: %v, err: %v", filelistresponse, err)
+					// logger.Trace().Msgf("Listfiles response: %v, err: %v", filelistresponse, err)
 					if err != nil {
 						logger.Error().Msgf("Error listing files in %v: %v", item.Name, err)
 						continue
@@ -139,9 +148,7 @@ func main() {
 						}
 					}
 					folders.AtomicMutate(folderinfo{
-						info: FileInfo{
-							Name: filelistresponse.ParentFolder,
-						},
+						name: filelistresponse.ParentFolder,
 					}, func(f *folderinfo) {
 						if f == nil {
 							logger.Error().Msgf("Error updating file count in folderinfo for %v", filelistresponse.ParentFolder)
@@ -150,10 +157,19 @@ func main() {
 						atomic.StoreInt32(&f.remaining, int32(filecount))
 					}, false)
 
+					// queue files first
 					for _, remotefi := range filelistresponse.Files {
-						localpath := filepath.Join(*folder, remotefi.Name)
-						logger.Trace().Msgf("Found file %s", remotefi.Name)
+						if !remotefi.IsDir {
+							// logger.Trace().Msgf("Queueing file %s", remotefi.Name)
+							filequeue <- remotefi
+						}
+					}
+
+					// queue folders second
+					for _, remotefi := range filelistresponse.Files {
 						if remotefi.IsDir {
+							localpath := filepath.Join(*folder, remotefi.Name)
+							// logger.Trace().Msgf("Queueing folder %s", remotefi.Name)
 							// check if folder exists
 							localfi, err := os.Stat(localpath)
 							created := false
@@ -185,16 +201,19 @@ func main() {
 								}
 							}
 
+							// logger.Trace().Msg("Queueing folder post")
 							listfiles.Add(1)
 							folders.Store(folderinfo{
-								info:      remotefi,
+								name:      remotefi.Name,
+								atim:      remotefi.Atim,
+								mtim:      remotefi.Mtim,
 								remaining: -1, // we don't know yet
 							})
 							folderqueue <- remotefi
-						} else {
-							filequeue <- remotefi
 						}
 					}
+
+					p.Add(FoldersProcessed, 1)
 					listfiles.Done()
 				}
 			}()
@@ -204,9 +223,8 @@ func main() {
 				logger.Trace().Msg("Starting file worker")
 				for remotefi := range filequeue {
 					localpath := filepath.Join(*folder, remotefi.Name)
-					logger.Debug().Msgf("Processing file %s", localpath)
+					logger.Trace().Msgf("Processing file %s", localpath)
 
-					exists := true // do we have it locally
 					create_file := false
 					copy_verify_file := false // do we need to copy it
 					apply_attributes := false // do we need to update owner etc.
@@ -214,8 +232,8 @@ func main() {
 					localfi, err := os.Lstat(localpath)
 					if err != nil {
 						if os.IsNotExist(err) {
-							logger.Trace().Msgf("File %s does not exist", localpath)
-							exists = false
+							logger.Debug().Msgf("File %s does not exist", localpath)
+							create_file = true
 						} else {
 							logger.Error().Msgf("Error getting stat stat for local path %s: %v", localpath, err)
 							continue
@@ -223,7 +241,7 @@ func main() {
 					}
 
 					// var localstat *syscall.Stat_t
-					if exists {
+					if !create_file {
 						var ok bool
 						localstat, ok := localfi.Sys().(*syscall.Stat_t)
 						if !ok {
@@ -231,7 +249,35 @@ func main() {
 							continue
 						}
 
-						if localstat.Mode&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
+						// if it's a hardlinked file, check that it's linked correctly
+						if remotefi.Nlink > 1 {
+							if ini, found := inodes.Load(inodeinfo{
+								inode: remotefi.Inode,
+							}); found {
+								otherlocalfi, err := os.Lstat(ini.path)
+								if err != nil {
+									logger.Error().Msgf("Error getting hardlink stat for local path %s: %v", localpath, err)
+									continue
+								}
+								otherlocalstat, ok := otherlocalfi.Sys().(*syscall.Stat_t)
+								if !ok {
+									logger.Error().Msgf("Could not obtain local native stat for %s", localpath)
+									continue
+								}
+
+								if localstat.Ino != otherlocalstat.Ino {
+									logger.Debug().Msgf("Hardlink %s and %s have different inodes but should match, unlinking file", localpath, ini.path)
+									err = os.Remove(localpath)
+									if err != nil {
+										logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
+										continue
+									}
+									create_file = true
+								}
+							}
+						}
+
+						if !create_file && localstat.Mode&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
 							logger.Debug().Msgf("File %s is indicating type change from %X to %X, unlinking", localpath, localstat.Mode&^uint32(os.ModePerm), remotefi.Permissions&^uint32(os.ModePerm))
 							err = os.Remove(localpath)
 							if err != nil {
@@ -240,9 +286,9 @@ func main() {
 							}
 
 							create_file = true
-							apply_attributes = true
-							exists = false
-						} else {
+						}
+
+						if !create_file { // still exists
 							if localfi.Size() > remotefi.Size && remotefi.Mode&fs.ModeSymlink == 0 {
 								logger.Debug().Msgf("File %s is indicating size change from %v to %v, truncating", localpath, localfi.Size(), remotefi.Size)
 								err = os.Truncate(localpath, int64(remotefi.Size))
@@ -263,48 +309,51 @@ func main() {
 								apply_attributes = true
 							}
 
-							if remotefi.Size > 0 && remotefi.Mode&fs.ModeSymlink == 0 && (apply_attributes || *checksum) {
-								logger.Debug().Msgf("File %s is indicating size changes, remote size is %v", localpath, remotefi.Size)
-								copy_verify_file = true
-							}
-						}
-					} else {
-						// Not existing
-						if !*hardlinks || remotefi.Nlink == 1 {
-							create_file = true
-							if remotefi.Size > 0 {
-								copy_verify_file = true
-							}
-							apply_attributes = true
-						} else {
-							if ini, found := inodes.Load(inodeinfo{
-								inode: remotefi.Inode,
-							}); found {
-								err = os.Link(filepath.Join(ini.path), localpath)
-								if err != nil {
-									logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.path, err)
-									continue
-								}
-								create_file = false
-								copy_verify_file = false
-								apply_attributes = true
-
-								// handle inode counters
-								nukeit := false
-								inodes.AtomicMutate(ini, func(i *inodeinfo) {
-									rest := atomic.AddInt32(&i.remaining, -1)
-									if rest == 0 {
-										nukeit = true
-									}
-								}, false)
-								if nukeit {
-									// No more references, free up some memory
-									logger.Trace().Msgf("No more references to %s, removing it from inode cache", ini.path)
-									inodes.Delete(ini)
-								}
-							}
 						}
 					}
+
+					if create_file {
+						apply_attributes = true
+					}
+
+					if remotefi.Size > 0 && remotefi.Mode&fs.ModeSymlink == 0 && (apply_attributes || *checksum) {
+						logger.Debug().Msgf("Doing file content validation for %s", localpath)
+						copy_verify_file = true
+					}
+
+					// try to hard link it
+					if create_file && *hardlinks && remotefi.Nlink > 1 {
+						if ini, found := inodes.Load(inodeinfo{
+							inode: remotefi.Inode,
+						}); found {
+							logger.Debug().Msgf("Hardlinking %s to %s", localpath, ini.path)
+							err = os.Link(filepath.Join(ini.path), localpath)
+							if err != nil {
+								logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.path, err)
+								continue
+							}
+							create_file = false
+							copy_verify_file = false
+							apply_attributes = true
+
+							// handle inode counters
+							nukeit := false
+							inodes.AtomicMutate(ini, func(i *inodeinfo) {
+								rest := atomic.AddInt32(&i.remaining, -1)
+								if rest == 0 {
+									nukeit = true
+								}
+							}, false)
+							if nukeit {
+								// No more references, free up some memory
+								logger.Trace().Msgf("No more references to %s, removing it from inode cache", ini.path)
+								inodes.Delete(ini)
+							}
+						} else {
+							logger.Debug().Msgf("Remote file %s indicates it should be hardlinked, but we don't have a match locally", localpath)
+						}
+					}
+
 					transfersuccess := true
 
 					var localfile *os.File
@@ -341,7 +390,7 @@ func main() {
 
 					if copy_verify_file {
 						// file exists but is different, copy it
-						logger.Trace().Msgf("Processing blocks for %s", remotefi.Name)
+						logger.Debug().Msgf("Processing blocks for %s", remotefi.Name)
 						var existingsize int64
 
 						// Open file if we didn't create it earlier
@@ -386,7 +435,7 @@ func main() {
 								Offset: uint64(i),
 								Size:   uint64(length),
 							}
-							if exists && i+length <= existingsize {
+							if i+length <= existingsize {
 								var hash uint64
 								err = client.Call("Server.ChecksumChunk", chunkArgs, &hash)
 								if err != nil {
@@ -400,6 +449,7 @@ func main() {
 									transfersuccess = false
 									break
 								}
+								p.Add(ReadBytes, uint64(length))
 								if n == int(length) {
 									localhash := xxhash.Sum64(localdata)
 									logger.Trace().Msgf("Checksum for file %s chunk at %d is %X, remote is %X", remotefi.Name, i, localhash, hash)
@@ -410,7 +460,7 @@ func main() {
 							}
 
 							var data []byte
-							logger.Trace().Msgf("Transferring file %s chunk at %d", remotefi.Name, i)
+							logger.Debug().Msgf("Transferring file %s chunk at %d", remotefi.Name, i)
 							err = client.Call("Server.GetChunk", chunkArgs, &data)
 							if err != nil {
 								logger.Error().Msgf("Error transferring file %s chunk at %d: %v", remotefi.Name, i, err)
@@ -428,6 +478,7 @@ func main() {
 								transfersuccess = false
 								break
 							}
+							p.Add(WrittenBytes, uint64(length))
 							apply_attributes = true
 						}
 						err = client.Call("Server.Close", remotefi.Name, nil)
@@ -450,9 +501,19 @@ func main() {
 							if err != nil {
 								logger.Error().Msgf("Error changing mode for %s: %v", localpath, err)
 							}
-							err = acl.Set(localpath, remotefi.ACL)
-							if err != nil {
-								logger.Error().Msgf("Error setting ACL for %s: %v", localpath, err)
+
+							if len(remotefi.ACL) > 0 {
+								currentacl, err := acl.Get(localpath)
+								if err != nil {
+									logger.Error().Msgf("Error getting ACL for %s: %v", localpath, err)
+								} else {
+									if !slices.Equal(currentacl, remotefi.ACL) {
+										err = acl.Set(localpath, remotefi.ACL)
+										if err != nil {
+											logger.Error().Msgf("Error setting ACL %+v (was %+v) for %s: %v", remotefi.ACL, currentacl, localpath, err)
+										}
+									}
+								}
 							}
 						}
 
@@ -464,27 +525,45 @@ func main() {
 
 					// are we done with this folder, the apply attributes to that
 					donewithfolder := false
+					foundfolder := false
 					lookupfolder := folderinfo{
-						info: FileInfo{
-							Name: filepath.Dir(remotefi.Name),
-						},
+						name: filepath.Dir(remotefi.Name),
 					}
+					var atim, mtim syscall.Timespec
 					folders.AtomicMutate(lookupfolder, func(item *folderinfo) {
-						if item == nil {
-							logger.Error().Msgf("Failed to find folder info for postprocessing %s", filepath.Dir(remotefi.Name))
-							return
-						}
+						foundfolder = true
 						left := atomic.AddInt32(&item.remaining, -1)
 						if left == 0 {
 							// Apply modify times to folder
-							logger.Debug().Msgf("Updating metadata for folder %s", item.info.Name)
-							err = wunix.UtimesNanoAt(unix.AT_FDCWD, item.info.Name, []unix.Timespec{unix.Timespec(item.info.Atim), unix.Timespec(item.info.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+							atim = item.atim
+							mtim = item.mtim
 							donewithfolder = true
 						}
 					}, false)
+					if !foundfolder {
+						logger.Error().Msgf("Failed to find folder info for postprocessing %s", lookupfolder.name)
+					}
 					if donewithfolder {
+						localname := filepath.Join(*folder, lookupfolder.name)
+						localfi, err := os.Stat(localname)
+						if err != nil {
+							logger.Error().Msgf("Error getting file info for folder %s: %v", lookupfolder.name, err)
+						}
+						localstat, ok := localfi.Sys().(*syscall.Stat_t)
+						if !ok {
+							logger.Error().Msgf("Error getting file info for folder %s: %v", lookupfolder.name, err)
+						}
+						if atim != localstat.Atim || mtim != localstat.Mtim {
+							logger.Debug().Msgf("Updating metadata for folder %s", localname)
+							err = wunix.UtimesNanoAt(unix.AT_FDCWD, localname, []unix.Timespec{unix.Timespec(atim), unix.Timespec(mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+							if err != nil {
+								logger.Error().Msgf("Error changing times for folder %s: %v", lookupfolder.name, err)
+							}
+						}
 						folders.Delete(lookupfolder)
 					}
+					p.Add(FilesProcessed, 1)
+					p.Add(BytesProcessed, uint64(remotefi.Size))
 				}
 				logger.Trace().Msg("Shutting down file worker")
 				wg.Done()
@@ -497,11 +576,29 @@ func main() {
 			Name: "/",
 		}
 
+		var done bool
+		go func() {
+			for !done {
+				time.Sleep(time.Second)
+				p.Add(FileQueue, uint64(len(filequeue)))
+				p.Add(FolderQueue, uint64(len(folderqueue)))
+				lasthistory := p.NextHistory()
+				logger.Info().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v folders/sec",
+					humanize.Bytes(lasthistory.counters[SentOverWire]+lasthistory.counters[RecievedOverWire]),
+					humanize.Bytes(lasthistory.counters[SentBytes]+lasthistory.counters[RecievedBytes]),
+					humanize.Bytes(lasthistory.counters[ReadBytes]+lasthistory.counters[WrittenBytes]),
+					humanize.Bytes(lasthistory.counters[BytesProcessed]),
+					lasthistory.counters[FilesProcessed],
+					lasthistory.counters[FoldersProcessed])
+			}
+		}()
+
 		listfiles.Wait()
 		close(folderqueue)
 		close(filequeue)
 
 		wg.Wait()
+		done = true
 
 		client.Close()
 	default:

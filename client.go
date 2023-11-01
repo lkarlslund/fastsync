@@ -1,5 +1,7 @@
 package main
 
+import "syscall"
+
 type inodeinfo struct {
 	inode     uint64
 	path      string
@@ -11,10 +13,12 @@ func (i inodeinfo) LessThan(i2 inodeinfo) bool {
 }
 
 type folderinfo struct {
+	name      string
+	atim      syscall.Timespec
+	mtim      syscall.Timespec
 	remaining int32
-	info      FileInfo
 }
 
 func (f folderinfo) LessThan(f2 folderinfo) bool {
-	return f.info.Name < f2.info.Name
+	return f.name < f2.name
 }
