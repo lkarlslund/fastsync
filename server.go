@@ -121,7 +121,7 @@ func (s *Server) Listfiles(path string, reply *FileListResponse) error {
 		}
 		if info.Mode()&os.ModeSymlink == 0 {
 			acl, err := acl.Get(absolutepath)
-			if err != nil {
+			if err != nil && err.Error() != "operation not supported" {
 				logger.Warn().Msgf("Failed to get ACL for file %v: %v", relativepath, err)
 			}
 			fi.ACL = acl
