@@ -112,7 +112,7 @@ func main() {
 
 		// Start the process
 		filequeue := make(chan FileInfo, 32768)
-		folderqueue := make(chan FileInfo, 16*1024*1024)
+		folderstack, folderqueueout, folderqueuein := NewStack[FileInfo]()
 
 		wconn := NewPerformanceWrapper(conn, p.GetAtomicAdder(RecievedOverWire), p.GetAtomicAdder(SentOverWire))
 		cconn := CompressedReadWriteCloser(wconn)
@@ -122,6 +122,7 @@ func main() {
 		client := rpc.NewClientWithCodec(rpcCodec)
 
 		var inodes gonk.Gonk[inodeinfo]
+		var deletedinodes int
 		var folders gonk.Gonk[folderinfo]
 
 		var wg sync.WaitGroup
@@ -131,7 +132,7 @@ func main() {
 			wg.Add(1)
 			go func() {
 				logger.Trace().Msg("Starting directory worker")
-				for item := range folderqueue {
+				for item := range folderqueueout {
 					logger.Trace().Msgf("Processing folder queue item for %s", item.Name)
 
 					var filelistresponse FileListResponse
@@ -209,7 +210,7 @@ func main() {
 								mtim:      remotefi.Mtim,
 								remaining: -1, // we don't know yet
 							})
-							folderqueue <- remotefi
+							folderqueuein <- remotefi
 						}
 					}
 
@@ -348,6 +349,11 @@ func main() {
 								// No more references, free up some memory
 								logger.Trace().Msgf("No more references to %s, removing it from inode cache", ini.path)
 								inodes.Delete(ini)
+								deletedinodes++
+								if inodes.Len()/4 < deletedinodes {
+									deletedinodes = 0
+									inodes.Optimize(gonk.Minimize)
+								}
 							}
 						} else {
 							logger.Debug().Msgf("Remote file %s indicates it should be hardlinked, but we don't have a match locally", localpath)
@@ -572,7 +578,7 @@ func main() {
 
 		logger.Debug().Msg("Requesting list of files in / from remote")
 		listfiles.Add(1)
-		folderqueue <- FileInfo{
+		folderqueuein <- FileInfo{
 			Name: "/",
 		}
 
@@ -581,7 +587,7 @@ func main() {
 			for !done {
 				time.Sleep(time.Second)
 				p.Add(FileQueue, uint64(len(filequeue)))
-				p.Add(FolderQueue, uint64(len(folderqueue)))
+				p.Add(FolderQueue, uint64(folderstack.Len()))
 				lasthistory := p.NextHistory()
 				logger.Info().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v folders/sec",
 					humanize.Bytes(lasthistory.counters[SentOverWire]+lasthistory.counters[RecievedOverWire]),
@@ -594,7 +600,7 @@ func main() {
 		}()
 
 		listfiles.Wait()
-		close(folderqueue)
+		folderstack.Close()
 		close(filequeue)
 
 		wg.Wait()
