@@ -112,7 +112,7 @@ func main() {
 
 		// Start the process
 		filequeue := make(chan FileInfo, 32768)
-		folderstack, folderqueueout, folderqueuein := NewStack[FileInfo]()
+		folderstack, folderqueueout, folderqueuein := NewStack[FileInfo](1024, 8)
 
 		wconn := NewPerformanceWrapper(conn, p.GetAtomicAdder(RecievedOverWire), p.GetAtomicAdder(SentOverWire))
 		cconn := CompressedReadWriteCloser(wconn)
