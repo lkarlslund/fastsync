@@ -81,7 +81,7 @@ func (s *Server) Listfiles(path string, reply *FileListResponse) error {
 		}
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 			fi.Inode = stat.Ino
-			fi.Nlink = stat.Nlink
+			fi.Nlink = uint64(stat.Nlink) // force to uint64 for 32-bit systems
 			fi.Dev = stat.Dev
 			fi.Rdev = stat.Rdev
 			fi.Owner = stat.Uid
