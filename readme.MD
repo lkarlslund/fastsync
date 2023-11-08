@@ -1,11 +1,16 @@
 # FastSync
 
-Fast syncronization across networks using speedy compression, lots of parallelization and fast hashmaps for keeping track of things internally
+## Fast syncronization across networks using speedy compression, lots of parallelization and fast hashmaps for keeping track of things internally
 
-*I made this because a customer asked me to transfer 100TB from one system to another. The data were raw backups with billions of files that were hardlinked together. Using rsync it seemed to progress very slowly and not load the RAID system enough - and it would always end badly with the machine running out of memory*
+I made this because a customer asked me to transfer 100TB from one system to another. The data were raw backups with billions of files that were hardlinked together. Using rsync it seemed to progress very slowly and not load the RAID system enough - and it would always end badly with the machine running out of memory
+
+#### ALPHA LEVEL CODE - DO NOT USE IN PRODUCTION - VERIFY YOUR DATA AFTER USING
+
+*this is just something I whisked together, so handle with care*
 
 Features:
-- server and client
+
+- server and client - sends files from server to client
 - preserves timestamps, owner UID, group GID, attributes
 - handles character devices, hardlinks, softlinks etc.
 - compresses data over the wire using snappy compression
@@ -18,7 +23,7 @@ FastSync consists of:
 Start up the source side, listening for unauthenticated clients
 
 ```bash
-fastsync [--folder /your/source/folder] [--bind 0.0.0.0:7113] server
+fastsync [--folder /your/source/folder] [--bind 0.0.0.0:7331] server
 ```
 
 ## Client mode
@@ -26,10 +31,11 @@ fastsync [--folder /your/source/folder] [--bind 0.0.0.0:7113] server
 Connects to the server and starts syncing files to the client
 
 ```bash
-fastsync [--hardlinks true] [--checksum false] [--pfile 4096] [--pdir 512] [--loglevel info] [--blocksize 131072] [--statsinterval 5] [--queueinterval 30] [--folder /your/target/folder] [--bind serverip:7113] client
+fastsync [--hardlinks true] [--checksum false] [--pfile 4096] [--pdir 512] [--loglevel info] [--blocksize 131072] [--statsinterval 5] [--queueinterval 30] [--folder /your/target/folder] [--bind serverip:7331] client
 ```
 
 Options:
+
 - ```pfile``` sets the number of parallel file IO operations, for large RAID systems with lots of drives or flash storage the default 4096 is probably okay, but expect major load on both systems
 - ```pdir``` sets the number of parallel folder listing operations
 
@@ -46,5 +52,6 @@ Options:
 - ```queueinterval``` is how often to output internal queue data, set to 0 to disable (mostly for debugging)
 
 Current limitations:
-- delete files on target that do not exist on the source
+
+- does not delete files on target that do not exist on the source
 - only works on Linux, as there is a lot of Posix specific code regarding inodes, owner etc.
