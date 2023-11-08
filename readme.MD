@@ -23,7 +23,7 @@ FastSync consists of:
 Start up the source side, listening for unauthenticated clients
 
 ```bash
-fastsync [--folder /your/source/folder] [--bind 0.0.0.0:7331] server
+fastsync [--directory /your/source/directory] [--bind 0.0.0.0:7331] server
 ```
 
 ## Client mode
@@ -31,13 +31,13 @@ fastsync [--folder /your/source/folder] [--bind 0.0.0.0:7331] server
 Connects to the server and starts syncing files to the client
 
 ```bash
-fastsync [--hardlinks true] [--checksum false] [--pfile 4096] [--pdir 512] [--loglevel info] [--blocksize 131072] [--statsinterval 5] [--queueinterval 30] [--folder /your/target/folder] [--bind serverip:7331] client
+fastsync [--hardlinks true] [--checksum false] [--pfile 4096] [--pdir 512] [--loglevel info] [--blocksize 131072] [--statsinterval 5] [--queueinterval 30] [--directory /your/target/directory] [--bind serverip:7331] client
 ```
 
 Options:
 
 - ```pfile``` sets the number of parallel file IO operations, for large RAID systems with lots of drives or flash storage the default 4096 is probably okay, but expect major load on both systems
-- ```pdir``` sets the number of parallel folder listing operations
+- ```pdir``` sets the number of parallel directory listing operations
 
 - ```checksum``` forces fastsync to check all data on all existing files using checksums for every block (otherwise it assumes files with same size, timestamp and attributes are equal)
 
@@ -54,4 +54,4 @@ Options:
 Current limitations:
 
 - does not delete files on target that do not exist on the source
-- only works on Linux, as there is a lot of Posix specific code regarding inodes, owner etc.
+- does not work on Windows, as there is a lot of Posix specific code regarding inodes, owner etc.

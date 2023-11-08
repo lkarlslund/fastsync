@@ -116,7 +116,7 @@ func main() {
 		c := NewClient()
 		c.BasePath = *directory
 		c.PreserveHardlinks = *hardlinks
-		c.ParalllelDir = *paralleldir
+		c.ParallelDir = *paralleldir
 		c.ParallelFile = *parallelfile
 		c.BlockSize = *transferblocksize
 		c.AlwaysChecksum = *checksum

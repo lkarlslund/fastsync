@@ -115,6 +115,7 @@ func InfoToFileInfo(info os.FileInfo, absolutepath string) (FileInfo, error) {
 }
 
 func (fi FileInfo) Compare(fi2 FileInfo) (different, requiresDelete bool) {
+	panic("not implemented")
 	return false, false
 }
 

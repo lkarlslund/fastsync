@@ -39,10 +39,10 @@ func (f dirinfo) LessThan(f2 dirinfo) bool {
 type Client struct {
 	BasePath string
 
-	AlwaysChecksum             bool
-	ParallelFile, ParalllelDir int
-	PreserveHardlinks          bool
-	BlockSize                  int
+	AlwaysChecksum            bool
+	ParallelFile, ParallelDir int
+	PreserveHardlinks         bool
+	BlockSize                 int
 
 	done bool
 
@@ -59,7 +59,7 @@ type Client struct {
 func NewClient() *Client {
 	c := &Client{
 		ParallelFile:      4096,
-		ParalllelDir:      512,
+		ParallelDir:       512,
 		PreserveHardlinks: true,
 		BlockSize:         128 * 1024,
 	}
@@ -74,10 +74,10 @@ func (c *Client) Run(client *rpc.Client) error {
 
 	var listfilesActive sync.WaitGroup
 
-	c.dirstack, c.dirqueueout, c.dirqueuein = NewStack[FileInfo](c.ParalllelDir*2, 8)
+	c.dirstack, c.dirqueueout, c.dirqueuein = NewStack[FileInfo](c.ParallelDir*2, 8)
 	c.filequeue = make(chan FileInfo, c.ParallelFile*16)
 
-	for i := 0; i < c.ParalllelDir; i++ {
+	for i := 0; i < c.ParallelDir; i++ {
 		c.dirWorkerWG.Add(1)
 		go func() {
 			logger.Trace().Msg("Starting directory worker")
@@ -209,7 +209,7 @@ func (c *Client) Run(client *rpc.Client) error {
 
 				if !create_file {
 					// if it's a hardlinked file, check that it's linked correctly
-					if remotefi.Nlink > 1 {
+					if remotefi.Nlink > 1 && c.PreserveHardlinks {
 						if ini, found := c.inodes.Load(inodeinfo{
 							inode: remotefi.Inode,
 						}); found {
