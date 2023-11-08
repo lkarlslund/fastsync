@@ -1,1 +1,3 @@
 ﻿fastsync
+binaries/*
+.vscode
