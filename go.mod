@@ -1,9 +1,8 @@
 module github.com/lkarlslund/fastsync
 
-go 1.21.1
+go 1.21
 
 require (
-	github.com/akihirosuda/x-sys-unix-auto-eintr v0.0.0-20200303093320-a5fb09464fb2
 	github.com/cespare/xxhash/v2 v2.2.0
 	github.com/dustin/go-humanize v1.0.1
 	github.com/joshlf/go-acl v0.0.0-20200411065538-eae00ae38531

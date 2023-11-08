@@ -7,7 +7,6 @@ import (
 	"slices"
 	"syscall"
 
-	wunix "github.com/akihirosuda/x-sys-unix-auto-eintr"
 	"github.com/joshlf/go-acl"
 	"github.com/pkg/xattr"
 	unix "golang.org/x/sys/unix"
@@ -177,7 +176,7 @@ func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 		}
 	}
 
-	err = wunix.UtimesNanoAt(unix.AT_FDCWD, fi.Name, []unix.Timespec{unix.Timespec(fi2.Atim), unix.Timespec(fi2.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+	err = unix.UtimesNanoAt(unix.AT_FDCWD, fi.Name, []unix.Timespec{unix.Timespec(fi2.Atim), unix.Timespec(fi2.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
 		logger.Error().Msgf("Error changing times for %s: %v", fi.Name, err)
 	}

@@ -10,7 +10,6 @@ import (
 	"syscall"
 	"time"
 
-	wunix "github.com/akihirosuda/x-sys-unix-auto-eintr"
 	"github.com/cespare/xxhash/v2"
 	"github.com/lkarlslund/gonk"
 	unix "golang.org/x/sys/unix"
@@ -142,13 +141,13 @@ func (c *Client) Run(client *rpc.Client) error {
 						localstat, ok := localfi.Sys().(*syscall.Stat_t)
 						_, localmtim, _ := getAMtime(*localstat)
 						if created || ok && localmtim != remotefi.Mtim {
-							err = wunix.UtimesNanoAt(unix.AT_FDCWD, localpath, []unix.Timespec{unix.Timespec(remotefi.Atim), unix.Timespec(remotefi.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+							err = unix.UtimesNanoAt(unix.AT_FDCWD, localpath, []unix.Timespec{unix.Timespec(remotefi.Atim), unix.Timespec(remotefi.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
 							if err != nil {
 								logger.Error().Msgf("Error setting times for directory %v: %v", localpath, err)
 							}
 						}
 						if created || ok && uint32(localstat.Mode)&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
-							err = wunix.Chmod(localpath, remotefi.Permissions)
+							err = unix.Chmod(localpath, remotefi.Permissions)
 							if err != nil {
 								logger.Error().Msgf("Error setting permissions for directory %v: %v", localpath, err)
 							}
@@ -475,7 +474,7 @@ func (c *Client) Run(client *rpc.Client) error {
 					localatim, localmtim, _ := getAMtime(*localstat)
 					if atim != localatim || mtim != localmtim {
 						logger.Debug().Msgf("Updating metadata for directory %s", localname)
-						err = wunix.UtimesNanoAt(unix.AT_FDCWD, localname, []unix.Timespec{unix.Timespec(atim), unix.Timespec(mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+						err = unix.UtimesNanoAt(unix.AT_FDCWD, localname, []unix.Timespec{unix.Timespec(atim), unix.Timespec(mtim)}, unix.AT_SYMLINK_NOFOLLOW)
 						if err != nil {
 							logger.Error().Msgf("Error changing times for directory %s: %v", lookupdirectory.name, err)
 						}
