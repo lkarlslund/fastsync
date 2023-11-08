@@ -35,8 +35,14 @@ func main() {
 	folder := pflag.String("folder", ".", "Folder to use as source or target")
 	checksum := pflag.Bool("checksum", false, "Checksum files")
 	bind := pflag.String("bind", "0.0.0.0:7331", "Address to bind/connect to")
-	parallel := pflag.Int("parallel", 1024, "Number of parallel operations")
+	parallelfile := pflag.Int("pfile", 4096, "Number of parallel file IO operations")
+	paralleldir := pflag.Int("pdir", 512, "Number of parallel dir scanning operations")
 	loglevel := pflag.String("loglevel", "info", "Log level")
+	transferblocksize := pflag.Int("blocksize", 128*1024, "Transfer/checksum block size")
+
+	transferstatsinterval := pflag.Int("statsinterval", 5, "Show transfer stats every N seconds, 0 to disable")
+	queuestatsinterval := pflag.Int("queueinterval", 30, "Show internal queue sizes every N seconds, 0 to disable")
+
 	pflag.Parse()
 
 	var err error
@@ -111,8 +117,8 @@ func main() {
 		logger.Info().Msgf("Connected to %s", *bind)
 
 		// Start the process
-		filequeue := make(chan FileInfo, 32768)
-		folderstack, folderqueueout, folderqueuein := NewStack[FileInfo](1024, 8)
+		filequeue := make(chan FileInfo, *parallelfile*16)
+		folderstack, folderqueueout, folderqueuein := NewStack[FileInfo](*paralleldir*2, 8)
 
 		wconn := NewPerformanceWrapper(conn, p.GetAtomicAdder(RecievedOverWire), p.GetAtomicAdder(SentOverWire))
 		cconn := CompressedReadWriteCloser(wconn)
@@ -128,7 +134,7 @@ func main() {
 		var wg sync.WaitGroup
 		var listfiles sync.WaitGroup
 
-		for i := 0; i < *parallel; i++ {
+		for i := 0; i < *paralleldir; i++ {
 			wg.Add(1)
 			go func() {
 				logger.Trace().Msg("Starting directory worker")
@@ -148,15 +154,18 @@ func main() {
 							filecount++
 						}
 					}
-					folders.AtomicMutate(folderinfo{
-						name: filelistresponse.ParentFolder,
-					}, func(f *folderinfo) {
-						if f == nil {
-							logger.Error().Msgf("Error updating file count in folderinfo for %v", filelistresponse.ParentFolder)
-							return
+					if item.Name != "/" {
+						var folderfound bool
+						folders.AtomicMutate(folderinfo{
+							name: item.Name,
+						}, func(f *folderinfo) {
+							atomic.StoreInt32(&f.remaining, int32(filecount))
+							folderfound = true
+						}, false)
+						if !folderfound {
+							logger.Error().Msgf("Folder %v not found in folder cache", filelistresponse.ParentFolder)
 						}
-						atomic.StoreInt32(&f.remaining, int32(filecount))
-					}, false)
+					}
 
 					// queue files first
 					for _, remotefi := range filelistresponse.Files {
@@ -218,7 +227,9 @@ func main() {
 					listfiles.Done()
 				}
 			}()
+		}
 
+		for i := 0; i < *parallelfile; i++ {
 			wg.Add(1)
 			go func() {
 				logger.Trace().Msg("Starting file worker")
@@ -229,6 +240,18 @@ func main() {
 					create_file := false
 					copy_verify_file := false // do we need to copy it
 					apply_attributes := false // do we need to update owner etc.
+
+					remaininghardlinks := int32(-1) // not relevant
+					if *hardlinks && remotefi.Nlink > 1 {
+						logger.Trace().Msgf("Saving remote inode number to cache for file %s", remotefi.Name)
+						inodes.AtomicMutate(inodeinfo{
+							inode:     remotefi.Inode,
+							path:      localpath,
+							remaining: int32(remotefi.Nlink),
+						}, func(i *inodeinfo) {
+							remaininghardlinks = atomic.AddInt32(&i.remaining, -1)
+						}, true)
+					}
 
 					localfi, err := os.Lstat(localpath)
 					if err != nil {
@@ -336,25 +359,6 @@ func main() {
 							create_file = false
 							copy_verify_file = false
 							apply_attributes = true
-
-							// handle inode counters
-							nukeit := false
-							inodes.AtomicMutate(ini, func(i *inodeinfo) {
-								rest := atomic.AddInt32(&i.remaining, -1)
-								if rest == 0 {
-									nukeit = true
-								}
-							}, false)
-							if nukeit {
-								// No more references, free up some memory
-								logger.Trace().Msgf("No more references to %s, removing it from inode cache", ini.path)
-								inodes.Delete(ini)
-								deletedinodes++
-								if inodes.Len()/4 < deletedinodes {
-									deletedinodes = 0
-									inodes.Optimize(gonk.Minimize)
-								}
-							}
 						} else {
 							logger.Debug().Msgf("Remote file %s indicates it should be hardlinked, but we don't have a match locally", localpath)
 						}
@@ -410,15 +414,6 @@ func main() {
 							existingsize = fi.Size()
 						}
 
-						if *hardlinks && remotefi.Nlink > 1 {
-							logger.Trace().Msgf("Saving remote inode number to cache for file %s", remotefi.Name)
-							inodes.Store(inodeinfo{
-								inode:     remotefi.Inode,
-								path:      localpath,
-								remaining: int32(remotefi.Nlink - 1),
-							})
-						}
-
 						err = client.Call("Server.Open", remotefi.Name, nil)
 						if err != nil {
 							logger.Error().Msgf("Error opening remote file %s: %v", remotefi.Name, err)
@@ -426,13 +421,13 @@ func main() {
 							break
 						}
 
-						for i := int64(0); i < remotefi.Size; i += 1000000 {
+						for i := int64(0); i < remotefi.Size; i += int64(*transferblocksize) {
 							if !transfersuccess {
 								break // we couldn't open the remote file
 							}
 
 							// Read the chunk
-							length := int64(1000000)
+							length := int64(*transferblocksize)
 							if i+length > remotefi.Size {
 								length = remotefi.Size - i
 							}
@@ -529,6 +524,18 @@ func main() {
 						}
 					}
 
+					// handle inode counters
+					if remaininghardlinks == 0 {
+						// No more references, free up some memory
+						logger.Trace().Msgf("No more references to this inode, removing it from inode cache")
+						inodes.Delete(inodeinfo{inode: remotefi.Inode})
+						deletedinodes++
+						if inodes.Len()/4 < deletedinodes {
+							deletedinodes = 0
+							inodes.Optimize(gonk.Minimize)
+						}
+					}
+
 					// are we done with this folder, the apply attributes to that
 					donewithfolder := false
 					foundfolder := false
@@ -539,6 +546,7 @@ func main() {
 					folders.AtomicMutate(lookupfolder, func(item *folderinfo) {
 						foundfolder = true
 						left := atomic.AddInt32(&item.remaining, -1)
+						logger.Trace().Msgf("Folder %s has usage %v left", item.name, left)
 						if left == 0 {
 							// Apply modify times to folder
 							atim = item.atim
@@ -583,21 +591,37 @@ func main() {
 		}
 
 		var done bool
-		go func() {
-			for !done {
-				time.Sleep(time.Second)
-				p.Add(FileQueue, uint64(len(filequeue)))
-				p.Add(FolderQueue, uint64(folderstack.Len()))
-				lasthistory := p.NextHistory()
-				logger.Info().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v folders/sec",
-					humanize.Bytes(lasthistory.counters[SentOverWire]+lasthistory.counters[RecievedOverWire]),
-					humanize.Bytes(lasthistory.counters[SentBytes]+lasthistory.counters[RecievedBytes]),
-					humanize.Bytes(lasthistory.counters[ReadBytes]+lasthistory.counters[WrittenBytes]),
-					humanize.Bytes(lasthistory.counters[BytesProcessed]),
-					lasthistory.counters[FilesProcessed],
-					lasthistory.counters[FoldersProcessed])
-			}
-		}()
+		if *transferstatsinterval > 0 {
+			go func() {
+				for !done {
+					time.Sleep(time.Duration(*transferstatsinterval) * time.Second)
+					p.Add(FileQueue, uint64(len(filequeue)))
+					p.Add(FolderQueue, uint64(folderstack.Len()))
+					lasthistory := p.NextHistory()
+					logger.Info().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v folders/sec",
+						humanize.Bytes(lasthistory.counters[SentOverWire]+lasthistory.counters[RecievedOverWire]/uint64(*transferstatsinterval)),
+						humanize.Bytes(lasthistory.counters[SentBytes]+lasthistory.counters[RecievedBytes]/uint64(*transferstatsinterval)),
+						humanize.Bytes(lasthistory.counters[ReadBytes]+lasthistory.counters[WrittenBytes]/uint64(*transferstatsinterval)),
+						humanize.Bytes(lasthistory.counters[BytesProcessed]/uint64(*transferstatsinterval)),
+						lasthistory.counters[FilesProcessed]/uint64(*transferstatsinterval),
+						lasthistory.counters[FoldersProcessed]/uint64(*transferstatsinterval))
+				}
+			}()
+		}
+
+		if *queuestatsinterval > 0 {
+			go func() {
+				for !done {
+					time.Sleep(time.Duration(*queuestatsinterval) * time.Second)
+					logger.Info().Msgf("Inode cache %v entries, directory cache %v entries, file queue %v files, directory queue %v directories",
+						inodes.Len(),
+						folders.Len(),
+						len(filequeue),
+						folderstack.Len(),
+					)
+				}
+			}()
+		}
 
 		listfiles.Wait()
 		folderstack.Close()
