@@ -53,7 +53,7 @@ const (
 	ReadBytes
 	BytesProcessed
 	FilesProcessed
-	FoldersProcessed
+	DirectoriesProcessed
 	FileQueue
 	FolderQueue
 	maxperformancecountertype

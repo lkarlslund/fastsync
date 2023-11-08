@@ -2,14 +2,10 @@ package main
 
 import (
 	"errors"
-	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/cespare/xxhash/v2"
-	"github.com/joshlf/go-acl"
 	"github.com/lkarlslund/gonk"
 )
 
@@ -29,35 +25,16 @@ type Server struct {
 	files gonk.Gonk[filehandleindex]
 }
 
-type FileInfo struct {
-	Name  string
-	Mode  fs.FileMode // Go simplified file type, not for chmod
-	Size  int64
-	IsDir bool
-
-	Permissions uint32
-	ACL         acl.ACL
-
-	Owner, Group uint32
-	Inode, Nlink uint64
-	Dev, Rdev    uint64
-	LinkTo       string
-
-	Atim syscall.Timespec
-	Mtim syscall.Timespec
-	Ctim syscall.Timespec
-}
-
 type FileListResponse struct {
-	ParentFolder string
-	Files        []FileInfo
+	ParentDirectory string
+	Files           []FileInfo
 }
 
 func (s *Server) List(path string, reply *FileListResponse) error {
 	logger.Trace().Msgf("Listing files in %s", path)
 
 	var flr FileListResponse
-	flr.ParentFolder = path
+	flr.ParentDirectory = path
 
 	entries, err := os.ReadDir(filepath.Join(s.BasePath, path))
 	if err != nil {
@@ -70,10 +47,12 @@ func (s *Server) List(path string, reply *FileListResponse) error {
 		if err != nil {
 			return err
 		}
-		fi, err := s.infoToFileInfo(info, relativepath, absolutepath)
+		fi, err := InfoToFileInfo(info, absolutepath)
 		if err != nil {
 			return err
 		}
+		// Override path to only send the relative path
+		fi.Name = relativepath
 		flr.Files = append(flr.Files, fi)
 	}
 	*reply = flr
@@ -90,66 +69,11 @@ func (s *Server) Stat(path string, reply *FileInfo) error {
 	if err != nil {
 		return err
 	}
-	fi, err := s.infoToFileInfo(info, relativepath, absolutepath)
+	fi, err := InfoToFileInfo(info, absolutepath)
+	// Override path to only send the relative path
+	fi.Name = relativepath
 	*reply = fi
 	return err
-}
-
-func (s *Server) infoToFileInfo(info os.FileInfo, relativepath, absolutepath string) (FileInfo, error) {
-	fi := FileInfo{
-		Name:  relativepath,
-		Mode:  info.Mode(),
-		Size:  info.Size(),
-		IsDir: info.IsDir(),
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		fi.Inode = stat.Ino
-		fi.Nlink = uint64(stat.Nlink) // force to uint64 for 32-bit systems
-		fi.Dev = uint64(stat.Dev)
-		fi.Rdev = uint64(stat.Rdev)
-		fi.Owner = stat.Uid
-		fi.Group = stat.Gid
-		fi.Permissions = stat.Mode
-
-		fi.Atim = stat.Atim
-		fi.Mtim = stat.Mtim
-		fi.Ctim = stat.Ctim
-
-		if fi.Mode&os.ModeSymlink != 0 {
-			logger.Debug().Msgf("Detected %v as symlink", fi.Name)
-			// Symlink - read link and store in fi variable
-			linkto := make([]byte, 65536)
-			n, err := syscall.Readlink(absolutepath, linkto)
-			if err != nil {
-				logger.Error().Msgf("Error reading link to %v: %v", fi.Name, err)
-			} else {
-				logger.Debug().Msgf("Detected %v as symlink to %v", fi.Name, string(linkto))
-			}
-			fi.LinkTo = string(linkto[0:n])
-		} else if fi.Mode&os.ModeCharDevice != 0 && fi.Mode&os.ModeDevice != 0 {
-			logger.Debug().Msgf("Detected %v as character device", fi.Name)
-		} else if fi.Mode&os.ModeDir != 0 {
-			logger.Debug().Msgf("Detected %v as directory", fi.Name)
-		} else if fi.Mode&os.ModeSocket != 0 {
-			logger.Debug().Msgf("Detected %v as socket", fi.Name)
-		} else if fi.Mode&os.ModeNamedPipe != 0 {
-			logger.Debug().Msgf("Detected %v as FIFO", fi.Name)
-		} else if fi.Mode&os.ModeDevice != 0 {
-			logger.Debug().Msgf("Detected %v as device", fi.Name)
-		} else {
-			logger.Debug().Msgf("Detected %v as regular file", fi.Name)
-		}
-	} else {
-		return fi, fmt.Errorf("stat failed, I got a %T", info.Sys())
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		acl, err := acl.Get(absolutepath)
-		if err != nil && err.Error() != "operation not supported" {
-			logger.Warn().Msgf("Failed to get ACL for file %v: %v", relativepath, err)
-		}
-		fi.ACL = acl
-	}
-	return fi, nil
 }
 
 type GetChunkArgs struct {

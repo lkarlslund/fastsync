@@ -25,6 +25,7 @@ require (
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/mattn/go-runewidth v0.0.14 // indirect
 	github.com/peterrk/slices v1.0.0 // indirect
+	github.com/pkg/xattr v0.4.9 // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
 	golang.org/x/exp v0.0.0-20230321023759-10a507213a29 // indirect
 	golang.org/x/term v0.0.0-20220526004731-065cf7ba2467 // indirect

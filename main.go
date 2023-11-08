@@ -21,7 +21,7 @@ func main() {
 	).With().Timestamp().Caller().Logger()
 
 	hardlinks := pflag.Bool("hardlinks", true, "Preserve hardlinks")
-	folder := pflag.String("folder", ".", "Folder to use as source or target")
+	directory := pflag.String("directory", ".", "Directory to use as source or target")
 	checksum := pflag.Bool("checksum", false, "Checksum files")
 	bind := pflag.String("bind", "0.0.0.0:7331", "Address to bind/connect to")
 	parallelfile := pflag.Int("pfile", 4096, "Number of parallel file IO operations")
@@ -35,8 +35,9 @@ func main() {
 	pflag.Parse()
 
 	var err error
-	if *folder == "." {
-		*folder, err = os.Getwd()
+	if *directory == "." {
+		// Get current working directory as absolute path
+		*directory, err = os.Getwd()
 		if err != nil {
 			logger.Fatal().Msgf("Error getting working directory: %v", err)
 		}
@@ -67,7 +68,7 @@ func main() {
 	case "server":
 		server := rpc.NewServer()
 		serverobject := &Server{
-			BasePath: *folder,
+			BasePath: *directory,
 			ReadOnly: true,
 		}
 		err := server.Register(serverobject)
@@ -113,10 +114,10 @@ func main() {
 		rpcClient := rpc.NewClientWithCodec(rpcCodec)
 
 		c := NewClient()
-		c.BasePath = *folder
+		c.BasePath = *directory
 		c.PreserveHardlinks = *hardlinks
-		c.Pdir = *paralleldir
-		c.Pfile = *parallelfile
+		c.ParalllelDir = *paralleldir
+		c.ParallelFile = *parallelfile
 		c.BlockSize = *transferblocksize
 		c.AlwaysChecksum = *checksum
 
@@ -125,13 +126,13 @@ func main() {
 				for !c.Done() {
 					time.Sleep(time.Duration(*transferstatsinterval) * time.Second)
 					lasthistory := p.NextHistory()
-					logger.Info().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v folders/sec",
+					logger.Info().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v dirs/sec",
 						humanize.Bytes((lasthistory.counters[SentOverWire]+lasthistory.counters[RecievedOverWire])/uint64(*transferstatsinterval)),
 						humanize.Bytes((lasthistory.counters[SentBytes]+lasthistory.counters[RecievedBytes])/uint64(*transferstatsinterval)),
 						humanize.Bytes((lasthistory.counters[ReadBytes]+lasthistory.counters[WrittenBytes])/uint64(*transferstatsinterval)),
 						humanize.Bytes((lasthistory.counters[BytesProcessed])/uint64(*transferstatsinterval)),
 						(lasthistory.counters[FilesProcessed])/uint64(*transferstatsinterval),
-						(lasthistory.counters[FoldersProcessed])/uint64(*transferstatsinterval))
+						(lasthistory.counters[DirectoriesProcessed])/uint64(*transferstatsinterval))
 				}
 			}()
 		}
@@ -140,9 +141,9 @@ func main() {
 			go func() {
 				for !c.Done() {
 					time.Sleep(time.Duration(*queuestatsinterval) * time.Second)
-					inodecache, foldercache, files, stack := c.Stats()
-					logger.Info().Msgf("Inode cache %v entries, directory cache %v entries, file queue %v files, directory queue %v directories",
-						inodecache, foldercache, files, stack)
+					inodecache, directorycache, files, stack := c.Stats()
+					logger.Info().Msgf("Inode cache %v, directory cache %v, file queue %v, directory queue %v",
+						inodecache, directorycache, files, stack)
 				}
 			}()
 		}

@@ -5,7 +5,6 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -13,7 +12,6 @@ import (
 
 	wunix "github.com/akihirosuda/x-sys-unix-auto-eintr"
 	"github.com/cespare/xxhash/v2"
-	"github.com/joshlf/go-acl"
 	"github.com/lkarlslund/gonk"
 	unix "golang.org/x/sys/unix"
 )
@@ -28,47 +26,44 @@ func (i inodeinfo) LessThan(i2 inodeinfo) bool {
 	return i.inode < i2.inode
 }
 
-type folderinfo struct {
+type dirinfo struct {
 	name      string
 	atim      syscall.Timespec
 	mtim      syscall.Timespec
 	remaining int32
 }
 
-func (f folderinfo) LessThan(f2 folderinfo) bool {
+func (f dirinfo) LessThan(f2 dirinfo) bool {
 	return f.name < f2.name
 }
 
 type Client struct {
 	BasePath string
 
-	AlwaysChecksum    bool
-	Pfile, Pdir       int
-	PreserveHardlinks bool
-	BlockSize         int
+	AlwaysChecksum             bool
+	ParallelFile, ParalllelDir int
+	PreserveHardlinks          bool
+	BlockSize                  int
 
 	done bool
 
 	dirWorkerWG, fileWorkerWG sync.WaitGroup
 
-	filequeue      chan FileInfo
-	inodes         gonk.Gonk[inodeinfo]
-	foldercache    gonk.Gonk[folderinfo]
-	folderstack    *stack[FileInfo]
-	folderqueuein  chan<- FileInfo
-	folderqueueout <-chan FileInfo
+	filequeue   chan FileInfo
+	inodes      gonk.Gonk[inodeinfo]
+	dircache    gonk.Gonk[dirinfo]
+	dirstack    *stack[FileInfo]
+	dirqueuein  chan<- FileInfo
+	dirqueueout <-chan FileInfo
 }
 
 func NewClient() *Client {
 	c := &Client{
-		Pfile:             4096,
-		Pdir:              512,
+		ParallelFile:      4096,
+		ParalllelDir:      512,
 		PreserveHardlinks: true,
 		BlockSize:         128 * 1024,
-		filequeue:         make(chan FileInfo, 4096*16),
 	}
-
-	c.folderstack, c.folderqueueout, c.folderqueuein = NewStack[FileInfo](c.Pdir*2, 8)
 
 	return c
 }
@@ -80,12 +75,15 @@ func (c *Client) Run(client *rpc.Client) error {
 
 	var listfilesActive sync.WaitGroup
 
-	for i := 0; i < c.Pdir; i++ {
+	c.dirstack, c.dirqueueout, c.dirqueuein = NewStack[FileInfo](c.ParalllelDir*2, 8)
+	c.filequeue = make(chan FileInfo, c.ParallelFile*16)
+
+	for i := 0; i < c.ParalllelDir; i++ {
 		c.dirWorkerWG.Add(1)
 		go func() {
 			logger.Trace().Msg("Starting directory worker")
-			for item := range c.folderqueueout {
-				logger.Trace().Msgf("Processing folder queue item for %s", item.Name)
+			for item := range c.dirqueueout {
+				logger.Trace().Msgf("Processing directory queue item for %s", item.Name)
 
 				var filelistresponse FileListResponse
 				err := client.Call("Server.List", item.Name, &filelistresponse)
@@ -100,15 +98,15 @@ func (c *Client) Run(client *rpc.Client) error {
 						filecount++
 					}
 				}
-				var folderfound bool
-				c.foldercache.AtomicMutate(folderinfo{
+				var directoryfound bool
+				c.dircache.AtomicMutate(dirinfo{
 					name: item.Name,
-				}, func(f *folderinfo) {
+				}, func(f *dirinfo) {
 					atomic.StoreInt32(&f.remaining, int32(filecount))
-					folderfound = true
+					directoryfound = true
 				}, false)
-				if !folderfound {
-					logger.Error().Msgf("Folder %v not found in folder cache", filelistresponse.ParentFolder)
+				if !directoryfound {
+					logger.Error().Msgf("directory %v not found in directory cache", filelistresponse.ParentDirectory)
 				}
 
 				// queue files first
@@ -119,62 +117,63 @@ func (c *Client) Run(client *rpc.Client) error {
 					}
 				}
 
-				// queue folders second
+				// queue directories second
 				for _, remotefi := range filelistresponse.Files {
 					if remotefi.IsDir {
 						localpath := filepath.Join(c.BasePath, remotefi.Name)
-						// logger.Trace().Msgf("Queueing folder %s", remotefi.Name)
-						// check if folder exists
+						// logger.Trace().Msgf("Queueing directory %s", remotefi.Name)
+						// check if directory exists
 						localfi, err := os.Stat(localpath)
 						created := false
 						if err != nil {
-							logger.Trace().Msgf("Creating folder %s", localpath)
+							logger.Trace().Msgf("Creating directory %s", localpath)
 							err = os.MkdirAll(localpath, 0755)
 							if err != nil {
-								logger.Error().Msgf("Error creating folder %v: %v", localpath, err)
+								logger.Error().Msgf("Error creating directory %v: %v", localpath, err)
 								continue
 							}
 							localfi, err = os.Stat(localpath)
 							if err != nil {
-								logger.Error().Msgf("Error getting stat for newly created folder %v: %v", localpath, err)
+								logger.Error().Msgf("Error getting stat for newly created directory %v: %v", localpath, err)
 								continue
 							}
 							created = true
 						}
 						localstat, ok := localfi.Sys().(*syscall.Stat_t)
-						if created || ok && localstat.Mtim != remotefi.Mtim {
+						_, localmtim, _ := getAMtime(*localstat)
+						if created || ok && localmtim != remotefi.Mtim {
 							err = wunix.UtimesNanoAt(unix.AT_FDCWD, localpath, []unix.Timespec{unix.Timespec(remotefi.Atim), unix.Timespec(remotefi.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
 							if err != nil {
-								logger.Error().Msgf("Error setting times for folder %v: %v", localpath, err)
+								logger.Error().Msgf("Error setting times for directory %v: %v", localpath, err)
 							}
 						}
-						if created || ok && localstat.Mode&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
+						if created || ok && uint32(localstat.Mode)&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
 							err = wunix.Chmod(localpath, remotefi.Permissions)
 							if err != nil {
-								logger.Error().Msgf("Error setting permissions for folder %v: %v", localpath, err)
+								logger.Error().Msgf("Error setting permissions for directory %v: %v", localpath, err)
 							}
 						}
 
-						logger.Trace().Msgf("Queueing folder %v", remotefi.Name)
+						logger.Trace().Msgf("Queueing directory %v", remotefi.Name)
 						listfilesActive.Add(1)
-						c.foldercache.Store(folderinfo{
+						c.dircache.Store(dirinfo{
 							name:      remotefi.Name,
 							atim:      remotefi.Atim,
 							mtim:      remotefi.Mtim,
 							remaining: -1, // we don't know yet
 						})
-						c.folderqueuein <- remotefi
+						c.dirqueuein <- remotefi
 					}
 				}
-				p.Add(FoldersProcessed, 1)
+				p.Add(DirectoriesProcessed, 1)
 				listfilesActive.Done()
 			}
-			logger.Trace().Msg("Shutting down folder worker")
+			logger.Trace().Msg("Shutting down directory worker")
 			c.dirWorkerWG.Done()
 		}()
 	}
 
-	for i := 0; i < c.Pfile; i++ {
+	for i := 0; i < c.ParallelFile; i++ {
 		c.fileWorkerWG.Add(1)
 		go func() {
 			logger.Trace().Msg("Starting file worker")
@@ -198,43 +197,30 @@ func (c *Client) Run(client *rpc.Client) error {
 					}, true)
 				}
 
-				localfi, err := os.Lstat(localpath)
+				localfi, err := PathToFileInfo(localpath)
 				if err != nil {
 					if os.IsNotExist(err) {
 						logger.Debug().Msgf("File %s does not exist", localpath)
 						create_file = true
 					} else {
-						logger.Error().Msgf("Error getting stat stat for local path %s: %v", localpath, err)
+						logger.Error().Msgf("Error getting fileinfo for local path %s: %v", localpath, err)
 						continue
 					}
 				}
 
-				// var localstat *syscall.Stat_t
 				if !create_file {
-					var ok bool
-					localstat, ok := localfi.Sys().(*syscall.Stat_t)
-					if !ok {
-						logger.Error().Msgf("Could not obtain local native stat for %s", localpath)
-						continue
-					}
-
 					// if it's a hardlinked file, check that it's linked correctly
 					if remotefi.Nlink > 1 {
 						if ini, found := c.inodes.Load(inodeinfo{
 							inode: remotefi.Inode,
 						}); found {
-							otherlocalfi, err := os.Lstat(ini.path)
+							otherlocalfi, err := PathToFileInfo(ini.path)
 							if err != nil {
 								logger.Error().Msgf("Error getting hardlink stat for local path %s: %v", localpath, err)
 								continue
 							}
-							otherlocalstat, ok := otherlocalfi.Sys().(*syscall.Stat_t)
-							if !ok {
-								logger.Error().Msgf("Could not obtain local native stat for %s", localpath)
-								continue
-							}
 
-							if localstat.Ino != otherlocalstat.Ino {
+							if localfi.Inode != otherlocalfi.Inode {
 								logger.Debug().Msgf("Hardlink %s and %s have different inodes but should match, unlinking file", localpath, ini.path)
 								err = os.Remove(localpath)
 								if err != nil {
@@ -246,8 +232,8 @@ func (c *Client) Run(client *rpc.Client) error {
 						}
 					}
 
-					if !create_file && localstat.Mode&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
-						logger.Debug().Msgf("File %s is indicating type change from %X to %X, unlinking", localpath, localstat.Mode&^uint32(os.ModePerm), remotefi.Permissions&^uint32(os.ModePerm))
+					if !create_file && uint32(localfi.Mode)&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
+						logger.Debug().Msgf("File %s is indicating type change from %X to %X, unlinking", localpath, uint32(localfi.Mode)&^uint32(os.ModePerm), remotefi.Permissions&^uint32(os.ModePerm))
 						err = os.Remove(localpath)
 						if err != nil {
 							logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
@@ -258,8 +244,8 @@ func (c *Client) Run(client *rpc.Client) error {
 					}
 
 					if !create_file { // still exists
-						if localfi.Size() > remotefi.Size && remotefi.Mode&fs.ModeSymlink == 0 {
-							logger.Debug().Msgf("File %s is indicating size change from %v to %v, truncating", localpath, localfi.Size(), remotefi.Size)
+						if localfi.Size > remotefi.Size && remotefi.Mode&fs.ModeSymlink == 0 {
+							logger.Debug().Msgf("File %s is indicating size change from %v to %v, truncating", localpath, localfi.Size, remotefi.Size)
 							err = os.Truncate(localpath, int64(remotefi.Size))
 							if err != nil {
 								logger.Error().Msgf("Error truncating %s to %v bytes to match remote: %v", localpath, remotefi.Size, err)
@@ -267,13 +253,12 @@ func (c *Client) Run(client *rpc.Client) error {
 							}
 							apply_attributes = true
 						}
-
-						if localstat.Mtim.Nano() != remotefi.Mtim.Nano() {
-							logger.Debug().Msgf("File %s is indicating time change from %v to %v, applying attribute changes", localpath, time.Unix(0, localstat.Mtim.Nano()), time.Unix(0, remotefi.Mtim.Nano()))
+						if localfi.Mtim.Nano() != remotefi.Mtim.Nano() {
+							logger.Debug().Msgf("File %s is indicating time change from %v to %v, applying attribute changes", localpath, time.Unix(0, localfi.Mtim.Nano()), time.Unix(0, remotefi.Mtim.Nano()))
 							apply_attributes = true
 						}
 
-						if localfi.Mode().Perm() != remotefi.Mode.Perm() || localstat.Uid != remotefi.Owner || localstat.Gid != remotefi.Group {
+						if localfi.Mode.Perm() != remotefi.Mode.Perm() || localfi.Owner != remotefi.Owner || localfi.Group != remotefi.Group {
 							logger.Debug().Msgf("File %s is indicating permissions changes, applying attribute changes", localpath)
 							apply_attributes = true
 						}
@@ -315,14 +300,14 @@ func (c *Client) Run(client *rpc.Client) error {
 				if create_file {
 					if remotefi.Mode&fs.ModeDevice != 0 {
 						if remotefi.Mode&fs.ModeCharDevice != 0 {
-							err = syscall.Mknod(localpath, syscall.S_IFCHR, int(remotefi.Rdev))
+							err = mkNod(localpath, syscall.S_IFCHR, remotefi.Rdev)
 							if err != nil {
 								logger.Error().Msgf("Error creating char device %s: %v", localpath, err)
 								continue
 							}
 						} else {
 							// Block device
-							err = syscall.Mknod(localpath, syscall.S_IFBLK, int(remotefi.Rdev))
+							err = mkNod(localpath, syscall.S_IFBLK, remotefi.Rdev)
 							if err != nil {
 								logger.Error().Msgf("Error creating block device %s: %v", localpath, err)
 								continue
@@ -438,34 +423,9 @@ func (c *Client) Run(client *rpc.Client) error {
 
 				if apply_attributes && transfersuccess {
 					logger.Debug().Msgf("Updating metadata for %s", remotefi.Name)
-					err = os.Lchown(localpath, int(remotefi.Owner), int(remotefi.Group))
+					err = localfi.ApplyChanges(remotefi)
 					if err != nil {
-						logger.Error().Msgf("Error changing owner for %s: %v", localpath, err)
-					}
-					if remotefi.Mode&fs.ModeSymlink == 0 {
-						err = os.Chmod(localpath, fs.FileMode(remotefi.Permissions))
-						if err != nil {
-							logger.Error().Msgf("Error changing mode for %s: %v", localpath, err)
-						}
-
-						if len(remotefi.ACL) > 0 {
-							currentacl, err := acl.Get(localpath)
-							if err != nil {
-								logger.Error().Msgf("Error getting ACL for %s: %v", localpath, err)
-							} else {
-								if !slices.Equal(currentacl, remotefi.ACL) {
-									err = acl.Set(localpath, remotefi.ACL)
-									if err != nil {
-										logger.Error().Msgf("Error setting ACL %+v (was %+v) for %s: %v", remotefi.ACL, currentacl, localpath, err)
-									}
-								}
-							}
-						}
-					}
-
-					err = wunix.UtimesNanoAt(unix.AT_FDCWD, localpath, []unix.Timespec{unix.Timespec(remotefi.Atim), unix.Timespec(remotefi.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
-					if err != nil {
-						logger.Error().Msgf("Error changing times for %s: %v", localpath, err)
+						logger.Error().Msgf("Error applying metadata for %s: %v", remotefi.Name, err)
 					}
 				}
 
@@ -481,45 +441,46 @@ func (c *Client) Run(client *rpc.Client) error {
 					}
 				}
 
-				// are we done with this folder, the apply attributes to that
-				donewithfolder := false
-				foundfolder := false
-				lookupfolder := folderinfo{
+				// are we done with this directory, the apply attributes to that
+				donewithdirectory := false
+				founddirectory := false
+				lookupdirectory := dirinfo{
 					name: filepath.Dir(remotefi.Name),
 				}
 				var atim, mtim syscall.Timespec
-				c.foldercache.AtomicMutate(lookupfolder, func(item *folderinfo) {
-					foundfolder = true
+				c.dircache.AtomicMutate(lookupdirectory, func(item *dirinfo) {
+					founddirectory = true
 					left := atomic.AddInt32(&item.remaining, -1)
-					logger.Trace().Msgf("Folder %s has usage %v left", item.name, left)
+					logger.Trace().Msgf("directory %s has usage %v left", item.name, left)
 					if left == 0 {
-						// Apply modify times to folder
+						// Apply modify times to directory
 						atim = item.atim
 						mtim = item.mtim
-						donewithfolder = true
+						donewithdirectory = true
 					}
 				}, false)
-				if !foundfolder {
-					logger.Error().Msgf("Failed to find folder info for postprocessing %s", lookupfolder.name)
+				if !founddirectory {
+					logger.Error().Msgf("Failed to find directory info for postprocessing %s", lookupdirectory.name)
 				}
-				if donewithfolder {
-					localname := filepath.Join(c.BasePath, lookupfolder.name)
+				if donewithdirectory {
+					localname := filepath.Join(c.BasePath, lookupdirectory.name)
 					localfi, err := os.Stat(localname)
 					if err != nil {
-						logger.Error().Msgf("Error getting file info for folder %s: %v", lookupfolder.name, err)
+						logger.Error().Msgf("Error getting file info for directory %s: %v", lookupdirectory.name, err)
 					}
 					localstat, ok := localfi.Sys().(*syscall.Stat_t)
 					if !ok {
-						logger.Error().Msgf("Error getting file info for folder %s: %v", lookupfolder.name, err)
+						logger.Error().Msgf("Error getting file info for directory %s: %v", lookupdirectory.name, err)
 					}
-					if atim != localstat.Atim || mtim != localstat.Mtim {
-						logger.Debug().Msgf("Updating metadata for folder %s", localname)
+					localatim, localmtim, _ := getAMtime(*localstat)
+					if atim != localatim || mtim != localmtim {
+						logger.Debug().Msgf("Updating metadata for directory %s", localname)
 						err = wunix.UtimesNanoAt(unix.AT_FDCWD, localname, []unix.Timespec{unix.Timespec(atim), unix.Timespec(mtim)}, unix.AT_SYMLINK_NOFOLLOW)
 						if err != nil {
-							logger.Error().Msgf("Error changing times for folder %s: %v", lookupfolder.name, err)
+							logger.Error().Msgf("Error changing times for directory %s: %v", lookupdirectory.name, err)
 						}
 					}
-					c.foldercache.Delete(lookupfolder)
+					c.dircache.Delete(lookupdirectory)
 				}
 				p.Add(FilesProcessed, 1)
 				p.Add(BytesProcessed, uint64(remotefi.Size))
@@ -530,26 +491,26 @@ func (c *Client) Run(client *rpc.Client) error {
 	}
 
 	// Get the party started
-	var rootfolderinfo FileInfo
-	err := client.Call("Server.Stat", "/", &rootfolderinfo)
+	var rootdirinfo FileInfo
+	err := client.Call("Server.Stat", "/", &rootdirinfo)
 	if err != nil {
 		return err
 	}
-	logger.Debug().Msg("Queueing folder / from remote")
+	logger.Debug().Msg("Queueing directory / from remote")
 	listfilesActive.Add(1)
-	c.foldercache.Store(folderinfo{
-		name:      rootfolderinfo.Name,
-		atim:      rootfolderinfo.Atim,
-		mtim:      rootfolderinfo.Mtim,
+	c.dircache.Store(dirinfo{
+		name:      rootdirinfo.Name,
+		atim:      rootdirinfo.Atim,
+		mtim:      rootdirinfo.Mtim,
 		remaining: -1,
 	})
-	c.folderqueuein <- rootfolderinfo
+	c.dirqueuein <- rootdirinfo
 
-	// wait for all folders to be listed
+	// wait for all directories to be listed
 	listfilesActive.Wait()
-	logger.Debug().Msg("No more folders to list")
-	// close the folder stack
-	c.folderstack.Close()
+	logger.Debug().Msg("No more directories to list")
+	// close the directory stack
+	c.dirstack.Close()
 	// wait for all directory workers to finish
 	c.dirWorkerWG.Wait()
 	// close the file queue so file workers can finish
@@ -565,11 +526,11 @@ func (c *Client) Done() bool {
 
 }
 
-func (c *Client) Stats() (inodes, folders, filequeue, folderstack int) {
+func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
 	return c.inodes.Len(),
-		c.folderstack.Len(),
+		c.dirstack.Len(),
 		len(c.filequeue),
-		c.folderstack.Len()
+		c.dirstack.Len()
 }
 
 func (c *Client) Wait() {
