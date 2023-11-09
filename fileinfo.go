@@ -62,28 +62,28 @@ func InfoToFileInfo(info os.FileInfo, absolutepath string) (FileInfo, error) {
 		fi.Ctim = ctim
 
 		if fi.Mode&os.ModeSymlink != 0 {
-			logger.Debug().Msgf("Detected %v as symlink", fi.Name)
+			logger.Trace().Msgf("Detected %v as symlink", fi.Name)
 			// Symlink - read link and store in fi variable
 			linkto := make([]byte, 65536)
 			n, err := syscall.Readlink(absolutepath, linkto)
 			if err != nil {
 				logger.Error().Msgf("Error reading link to %v: %v", fi.Name, err)
 			} else {
-				logger.Debug().Msgf("Detected %v as symlink to %v", fi.Name, string(linkto))
+				logger.Trace().Msgf("Detected %v as symlink to %v", fi.Name, string(linkto))
 			}
 			fi.LinkTo = string(linkto[0:n])
 		} else if fi.Mode&os.ModeCharDevice != 0 && fi.Mode&os.ModeDevice != 0 {
-			logger.Debug().Msgf("Detected %v as character device", fi.Name)
+			logger.Trace().Msgf("Detected %v as character device", fi.Name)
 		} else if fi.Mode&os.ModeDir != 0 {
-			logger.Debug().Msgf("Detected %v as directory", fi.Name)
+			logger.Trace().Msgf("Detected %v as directory", fi.Name)
 		} else if fi.Mode&os.ModeSocket != 0 {
-			logger.Debug().Msgf("Detected %v as socket", fi.Name)
+			logger.Trace().Msgf("Detected %v as socket", fi.Name)
 		} else if fi.Mode&os.ModeNamedPipe != 0 {
-			logger.Debug().Msgf("Detected %v as FIFO", fi.Name)
+			logger.Trace().Msgf("Detected %v as FIFO", fi.Name)
 		} else if fi.Mode&os.ModeDevice != 0 {
-			logger.Debug().Msgf("Detected %v as device", fi.Name)
+			logger.Trace().Msgf("Detected %v as device", fi.Name)
 		} else {
-			logger.Debug().Msgf("Detected %v as regular file", fi.Name)
+			logger.Trace().Msgf("Detected %v as regular file", fi.Name)
 		}
 	} else {
 		return fi, fmt.Errorf("stat failed, I got a %T", info.Sys())
@@ -126,7 +126,8 @@ func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 		logger.Error().Msgf("Error changing owner for %s: %v", fi.Name, err)
 	}
 	if fi2.Mode&fs.ModeSymlink == 0 {
-		err = unix.Chmod(fi.Name, fi2.Permissions)
+		// err = unix.Chmod(fi.Name, fi2.Permissions)
+		err = os.Chmod(fi.Name, fi2.Mode)
 		if err != nil {
 			logger.Error().Msgf("Error changing mode for %s: %v", fi.Name, err)
 		}

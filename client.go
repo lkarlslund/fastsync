@@ -235,8 +235,8 @@ func (c *Client) Run(client *rpc.Client) error {
 						}
 					}
 
-					if !create_file && uint32(localfi.Permissions)&^uint32(os.ModePerm) != uint32(remotefi.Permissions)&^uint32(os.ModePerm) {
-						logger.Debug().Msgf("File %s is indicating type change from %X to %X, unlinking", localpath, uint32(localfi.Permissions)&^uint32(os.ModePerm), remotefi.Permissions&^uint32(os.ModePerm))
+					if !create_file && localfi.Mode&os.ModeType != remotefi.Mode&os.ModeType {
+						logger.Debug().Msgf("File %s is indicating type change from %v to %v, unlinking", localpath, localfi.Mode.String(), remotefi.Mode.String())
 						err = os.Remove(localpath)
 						if err != nil {
 							logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
@@ -325,6 +325,18 @@ func (c *Client) Run(client *rpc.Client) error {
 								logger.Error().Msgf("Error creating block device %s: %v", localpath, err)
 								continue
 							}
+						}
+					} else if remotefi.Mode&fs.ModeNamedPipe != 0 {
+						err = mkNod(localpath, syscall.S_IFIFO, remotefi.Rdev)
+						if err != nil {
+							logger.Error().Msgf("Error creating fifo %s: %v", localpath, err)
+							continue
+						}
+					} else if remotefi.Mode&fs.ModeSocket != 0 {
+						err = mkNod(localpath, syscall.S_IFSOCK, remotefi.Rdev)
+						if err != nil {
+							logger.Error().Msgf("Error creating socket %s: %v", localpath, err)
+							continue
 						}
 					} else if remotefi.Mode&fs.ModeSymlink != 0 {
 						err = syscall.Symlink(remotefi.LinkTo, localpath)
@@ -477,17 +489,9 @@ func (c *Client) Run(client *rpc.Client) error {
 				}
 				if donewithdirectory {
 					localname := filepath.Join(c.BasePath, lookupdirectory.name)
-					localfi, err := os.Stat(localname)
-					if err != nil {
-						logger.Error().Msgf("Error getting file info for directory %s: %v", lookupdirectory.name, err)
-					}
-					localstat, ok := localfi.Sys().(*syscall.Stat_t)
-					if !ok {
-						logger.Error().Msgf("Error getting file info for directory %s: %v", lookupdirectory.name, err)
-					}
-					localatim, localmtim, _ := getAMtime(*localstat)
-					if atim != localatim || mtim != localmtim {
-						logger.Debug().Msgf("Updating metadata for directory %s", localname)
+					localfi, err := PathToFileInfo(localname)
+					if localfi.Atim != atim || localfi.Mtim != mtim {
+						logger.Trace().Msgf("Updating metadata for directory %s", localname)
 						err = unix.UtimesNanoAt(unix.AT_FDCWD, localname, []unix.Timespec{unix.Timespec(atim), unix.Timespec(mtim)}, unix.AT_SYMLINK_NOFOLLOW)
 						if err != nil {
 							logger.Error().Msgf("Error changing times for directory %s: %v", lookupdirectory.name, err)
