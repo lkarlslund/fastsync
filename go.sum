@@ -22,6 +22,8 @@ github.com/lkarlslund/gonk v0.0.0-20230414120804-21c23f637b3d h1:nKfud/iW61+hUZr
 github.com/lkarlslund/gonk v0.0.0-20230414120804-21c23f637b3d/go.mod h1:xMCihDjt22DNIe244UyYxKCLc7JorHbQJZCs7wuy6Ho=
 github.com/lkarlslund/gonk v0.0.0-20231101104906-f756ea1f09fb h1:PYNT/ZVjfD3MEhGgV//DJgbpbhE75O3drLh1DFrIIw0=
 github.com/lkarlslund/gonk v0.0.0-20231101104906-f756ea1f09fb/go.mod h1:xMCihDjt22DNIe244UyYxKCLc7JorHbQJZCs7wuy6Ho=
+github.com/lkarlslund/gonk v0.0.0-20231109133400-ea64541f9ea1 h1:QGds6l/VjMczVgg2bAoIpGDSWPMYXKxfygFGPyqPQoM=
+github.com/lkarlslund/gonk v0.0.0-20231109133400-ea64541f9ea1/go.mod h1:xMCihDjt22DNIe244UyYxKCLc7JorHbQJZCs7wuy6Ho=
 github.com/lucasb-eyer/go-colorful v1.2.0 h1:1nnpGOrhyZZuNyfu1QjKiUICQ74+3FNCN69Aj6K7nkY=
 github.com/lucasb-eyer/go-colorful v1.2.0/go.mod h1:R4dSotOR9KMtayYi1e77YzuveK+i7ruzyGqttikkLy0=
 github.com/mattn/go-colorable v0.1.13 h1:fFA4WZxdEF4tXPZVKMLwD8oUnCTTo08duU7wxecdEvA=

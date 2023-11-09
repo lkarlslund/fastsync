@@ -7,7 +7,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1
 	github.com/joshlf/go-acl v0.0.0-20200411065538-eae00ae38531
 	github.com/klauspost/compress v1.17.2
-	github.com/lkarlslund/gonk v0.0.0-20231101104906-f756ea1f09fb
+	github.com/lkarlslund/gonk v0.0.0-20231109133400-ea64541f9ea1
 	github.com/mum4k/termdash v0.18.0
 	github.com/rs/zerolog v1.31.0
 	github.com/spf13/pflag v1.0.5

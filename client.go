@@ -186,13 +186,16 @@ func (c *Client) Run(client *rpc.Client) error {
 
 				remaininghardlinks := int32(-1) // not relevant
 				if c.PreserveHardlinks && remotefi.Nlink > 1 {
-					logger.Trace().Msgf("Saving remote inode number to cache for file %s", remotefi.Name)
+					logger.Trace().Msgf("Saving/updating remote inode number %v to cache for file %s with %d hardlinks", remotefi.Inode, remotefi.Name, remotefi.Nlink)
 					c.inodes.AtomicMutate(inodeinfo{
 						inode:     remotefi.Inode,
 						path:      localpath,
 						remaining: int32(remotefi.Nlink),
 					}, func(i *inodeinfo) {
 						remaininghardlinks = atomic.AddInt32(&i.remaining, -1)
+						if remaininghardlinks == int32(remotefi.Nlink-1) {
+							logger.Trace().Msgf("Added file %s to inode cache", remotefi.Name)
+						}
 					}, true)
 				}
 
@@ -200,6 +203,7 @@ func (c *Client) Run(client *rpc.Client) error {
 				if err != nil {
 					if os.IsNotExist(err) {
 						logger.Debug().Msgf("File %s does not exist", localpath)
+						localfi.Name = localpath
 						create_file = true
 					} else {
 						logger.Error().Msgf("Error getting fileinfo for local path %s: %v", localpath, err)
@@ -279,17 +283,19 @@ func (c *Client) Run(client *rpc.Client) error {
 					if ini, found := c.inodes.Load(inodeinfo{
 						inode: remotefi.Inode,
 					}); found {
-						logger.Debug().Msgf("Hardlinking %s to %s", localpath, ini.path)
-						err = os.Link(filepath.Join(ini.path), localpath)
-						if err != nil {
-							logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.path, err)
-							continue
+						if localpath != ini.path {
+							logger.Debug().Msgf("Hardlinking %s to %s", localpath, ini.path)
+							err = os.Link(filepath.Join(ini.path), localpath)
+							if err != nil {
+								logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.path, err)
+								continue
+							}
+							create_file = false
+							copy_verify_file = false
+							apply_attributes = true
 						}
-						create_file = false
-						copy_verify_file = false
-						apply_attributes = true
 					} else {
-						logger.Debug().Msgf("Remote file %s indicates it should be hardlinked, but we don't have a match locally", localpath)
+						logger.Error().Msgf("Remote file %s indicates it should be hardlinked with %v others, but we don't have a match locally", remotefi.Name, remotefi.Nlink)
 					}
 				}
 
@@ -516,6 +522,8 @@ func (c *Client) Run(client *rpc.Client) error {
 	close(c.filequeue)
 	// wait for all workers to finish
 	c.fileWorkerWG.Wait()
+
+	logger.Debug().Msg("Client routine done")
 
 	return nil
 }
