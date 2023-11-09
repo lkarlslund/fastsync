@@ -56,7 +56,7 @@ func InfoToFileInfo(info os.FileInfo, absolutepath string) (FileInfo, error) {
 		fi.Group = stat.Gid
 		fi.Permissions = uint32(stat.Mode)
 
-		atim, ctim, mtim := getAMtime(*stat)
+		atim, mtim, ctim := getAMtime(*stat)
 		fi.Atim = atim
 		fi.Mtim = mtim
 		fi.Ctim = ctim
@@ -126,7 +126,7 @@ func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 		logger.Error().Msgf("Error changing owner for %s: %v", fi.Name, err)
 	}
 	if fi2.Mode&fs.ModeSymlink == 0 {
-		err = os.Chmod(fi.Name, fs.FileMode(fi2.Permissions))
+		err = unix.Chmod(fi.Name, fi2.Permissions)
 		if err != nil {
 			logger.Error().Msgf("Error changing mode for %s: %v", fi.Name, err)
 		}
