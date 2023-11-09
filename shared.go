@@ -5,7 +5,6 @@ import (
 	"sync/atomic"
 
 	"github.com/klauspost/compress/s2"
-	"github.com/klauspost/compress/snappy"
 )
 
 type compressedConn struct {
@@ -15,8 +14,8 @@ type compressedConn struct {
 }
 
 func CompressedReadWriteCloser(rwc io.ReadWriteCloser) io.ReadWriteCloser {
-	r := snappy.NewReader(rwc)
-	w := snappy.NewBufferedWriter(rwc)
+	r := s2.NewReader(rwc)
+	w := s2.NewWriter(rwc, s2.WriterFlushOnWrite())
 	return &compressedConn{
 		r,
 		w,
@@ -31,7 +30,6 @@ func (c *compressedConn) Read(p []byte) (n int, err error) {
 
 func (c *compressedConn) Write(p []byte) (n int, err error) {
 	n, err = c.w.Write(p)
-	c.w.Flush()
 	return
 }
 
