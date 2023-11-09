@@ -235,8 +235,8 @@ func (c *Client) Run(client *rpc.Client) error {
 						}
 					}
 
-					if !create_file && uint32(localfi.Mode)&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
-						logger.Debug().Msgf("File %s is indicating type change from %X to %X, unlinking", localpath, uint32(localfi.Mode)&^uint32(os.ModePerm), remotefi.Permissions&^uint32(os.ModePerm))
+					if !create_file && uint32(localfi.Permissions)&^uint32(os.ModePerm) != uint32(remotefi.Permissions)&^uint32(os.ModePerm) {
+						logger.Debug().Msgf("File %s is indicating type change from %X to %X, unlinking", localpath, uint32(localfi.Permissions)&^uint32(os.ModePerm), remotefi.Permissions&^uint32(os.ModePerm))
 						err = os.Remove(localpath)
 						if err != nil {
 							logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
@@ -300,6 +300,14 @@ func (c *Client) Run(client *rpc.Client) error {
 				}
 
 				transfersuccess := true
+
+				if create_file {
+					logger.Info().Msgf("Creating file %s", localpath)
+				} else if copy_verify_file {
+					logger.Info().Msgf("Updating/verifying file %s", localpath)
+				} else if apply_attributes {
+					logger.Info().Msgf("Applying attributes to file %s", localpath)
+				}
 
 				var localfile *os.File
 				if create_file {
