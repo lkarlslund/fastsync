@@ -22,12 +22,21 @@ type Server struct {
 	BasePath string
 	ReadOnly bool
 
-	files gonk.Gonk[filehandleindex]
+	shutdown chan struct{}
+	files    gonk.Gonk[filehandleindex]
 }
 
 type FileListResponse struct {
 	ParentDirectory string
 	Files           []FileInfo
+}
+
+func (s *Server) Shutdown(input any, reply *any) error {
+	logger.Info().Msg("Shutting down server")
+	if len(s.shutdown) == 0 {
+		s.shutdown <- struct{}{}
+	}
+	return nil
 }
 
 func (s *Server) List(path string, reply *FileListResponse) error {
@@ -149,4 +158,8 @@ func (s *Server) Close(path string, reply *interface{}) error {
 	s.files.Delete(fi)
 	fi.fh.Close()
 	return nil
+}
+
+func (s *Server) Wait() {
+	<-s.shutdown
 }

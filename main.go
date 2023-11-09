@@ -84,6 +84,7 @@ func main() {
 		serverobject := &Server{
 			BasePath: *directory,
 			ReadOnly: true,
+			shutdown: make(chan struct{}),
 		}
 		err := server.Register(serverobject)
 		if err != nil {
@@ -95,23 +96,26 @@ func main() {
 			logger.Fatal().Msgf("Error binding listener: %v", err)
 		}
 		logger.Info().Msgf("Listening on %s", *bind)
-		for {
-			conn, err := listener.Accept()
-			logger.Info().Msgf("Accepted connection from %v", conn.RemoteAddr())
-			if err != nil {
-				logger.Error().Msgf("Error accepting connection: %v", err)
-				continue
+		go func() {
+			for {
+				conn, err := listener.Accept()
+				logger.Info().Msgf("Accepted connection from %v", conn.RemoteAddr())
+				if err != nil {
+					logger.Error().Msgf("Error accepting connection: %v", err)
+					continue
+				}
+				wconn := NewPerformanceWrapper(conn, p.GetAtomicAdder(RecievedOverWire), p.GetAtomicAdder(SentOverWire))
+				cconn := CompressedReadWriteCloser(wconn)
+				wcconn := NewPerformanceWrapper(cconn, p.GetAtomicAdder(RecievedBytes), p.GetAtomicAdder(SentBytes))
+				go func() {
+					var h codec.MsgpackHandle
+					server.ServeCodec(codec.GoRpc.ServerCodec(wcconn, &h))
+					logger.Info().Msgf("Closed connection from %v", conn.RemoteAddr())
+				}()
 			}
-			wconn := NewPerformanceWrapper(conn, p.GetAtomicAdder(RecievedOverWire), p.GetAtomicAdder(SentOverWire))
-			cconn := CompressedReadWriteCloser(wconn)
-			wcconn := NewPerformanceWrapper(cconn, p.GetAtomicAdder(RecievedBytes), p.GetAtomicAdder(SentBytes))
-			go func() {
-				var h codec.MsgpackHandle
-				server.ServeCodec(codec.GoRpc.ServerCodec(wcconn, &h))
-				logger.Info().Msgf("Closed connection from %v", conn.RemoteAddr())
-			}()
-		}
-	case "client":
+		}()
+		serverobject.Wait()
+	case "client", "shutdown":
 		//RPC Communication (client side)
 		conn, err := net.Dial("tcp", *bind)
 		if err != nil {
@@ -126,6 +130,16 @@ func main() {
 		var h codec.MsgpackHandle
 		rpcCodec := codec.GoRpc.ClientCodec(wcconn, &h)
 		rpcClient := rpc.NewClientWithCodec(rpcCodec)
+
+		if strings.ToLower(pflag.Arg(0)) == "shutdown" {
+			logger.Info().Msg("Shutting down server")
+			err := rpcClient.Call("Server.Shutdown", nil, nil)
+			if err != nil {
+				logger.Fatal().Msgf("Error shutting down: %v", err)
+			}
+			logger.Info().Msg("Server is shut down")
+			os.Exit(0)
+		}
 
 		c := NewClient()
 		c.BasePath = *directory
