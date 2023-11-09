@@ -1,9 +1,11 @@
 package main
 
 import (
+	"log"
 	"net"
 	"net/rpc"
 	"os"
+	"runtime/pprof"
 	"strings"
 	"time"
 
@@ -20,19 +22,31 @@ func main() {
 		zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339},
 	).With().Timestamp().Caller().Logger()
 
+	// sync settings
+	bind := pflag.String("bind", "0.0.0.0:7331", "Address to bind/connect to")
 	hardlinks := pflag.Bool("hardlinks", true, "Preserve hardlinks")
 	directory := pflag.String("directory", ".", "Directory to use as source or target")
 	checksum := pflag.Bool("checksum", false, "Checksum files")
-	bind := pflag.String("bind", "0.0.0.0:7331", "Address to bind/connect to")
+	// performance settings
 	parallelfile := pflag.Int("pfile", 4096, "Number of parallel file IO operations")
 	paralleldir := pflag.Int("pdir", 512, "Number of parallel dir scanning operations")
-	loglevel := pflag.String("loglevel", "info", "Log level")
 	transferblocksize := pflag.Int("blocksize", 128*1024, "Transfer/checksum block size")
-
+	// debugging etc
+	loglevel := pflag.String("loglevel", "info", "Log level")
+	cpuprofile := pflag.String("cpuprofile", "", "Write cpu profile to file")
 	transferstatsinterval := pflag.Int("statsinterval", 5, "Show transfer stats every N seconds, 0 to disable")
 	queuestatsinterval := pflag.Int("queueinterval", 30, "Show internal queue sizes every N seconds, 0 to disable")
 
 	pflag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
 	var err error
 	if *directory == "." {
