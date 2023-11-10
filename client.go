@@ -12,17 +12,16 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/lkarlslund/gonk"
-	unix "golang.org/x/sys/unix"
 )
 
 type inodeinfo struct {
-	inode     uint64
-	path      string
-	remaining int32
+	dev, inode uint64
+	path       string
+	remaining  int32
 }
 
 func (i inodeinfo) LessThan(i2 inodeinfo) bool {
-	return i.inode < i2.inode
+	return i.dev < i2.dev || (i.dev == i2.dev && i.inode < i2.inode)
 }
 
 type dirinfo struct {
@@ -44,7 +43,7 @@ type Client struct {
 	PreserveHardlinks         bool
 	BlockSize                 int
 
-	done bool
+	shutdown, done bool
 
 	dirWorkerWG, fileWorkerWG sync.WaitGroup
 
@@ -122,8 +121,7 @@ func (c *Client) Run(client *rpc.Client) error {
 						localpath := filepath.Join(c.BasePath, remotefi.Name)
 						// logger.Trace().Msgf("Queueing directory %s", remotefi.Name)
 						// check if directory exists
-						localfi, err := os.Stat(localpath)
-						created := false
+						localstat, err := PathToFileInfo(localpath)
 						if err != nil {
 							logger.Trace().Msgf("Creating directory %s", localpath)
 							err = os.MkdirAll(localpath, 0755)
@@ -131,23 +129,14 @@ func (c *Client) Run(client *rpc.Client) error {
 								logger.Error().Msgf("Error creating directory %v: %v", localpath, err)
 								continue
 							}
-							localfi, err = os.Stat(localpath)
+							localstat, err = PathToFileInfo(localpath)
 							if err != nil {
 								logger.Error().Msgf("Error getting stat for newly created directory %v: %v", localpath, err)
 								continue
 							}
-							created = true
 						}
-						localstat, ok := localfi.Sys().(*syscall.Stat_t)
-						_, localmtim, _ := getAMtime(*localstat)
-						if created || ok && localmtim != remotefi.Mtim {
-							err = unix.UtimesNanoAt(unix.AT_FDCWD, localpath, []unix.Timespec{unix.Timespec(remotefi.Atim), unix.Timespec(remotefi.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
-							if err != nil {
-								logger.Error().Msgf("Error setting times for directory %v: %v", localpath, err)
-							}
-						}
-						if created || ok && uint32(localstat.Mode)&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
-							err = unix.Chmod(localpath, remotefi.Permissions)
+						if uint32(localstat.Mode)&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
+							err = localstat.Chmod(remotefi)
 							if err != nil {
 								logger.Error().Msgf("Error setting permissions for directory %v: %v", localpath, err)
 							}
@@ -188,6 +177,7 @@ func (c *Client) Run(client *rpc.Client) error {
 				if c.PreserveHardlinks && remotefi.Nlink > 1 {
 					logger.Trace().Msgf("Saving/updating remote inode number %v to cache for file %s with %d hardlinks", remotefi.Inode, remotefi.Name, remotefi.Nlink)
 					c.inodes.AtomicMutate(inodeinfo{
+						dev:       remotefi.Dev,
 						inode:     remotefi.Inode,
 						path:      localpath,
 						remaining: int32(remotefi.Nlink),
@@ -215,6 +205,7 @@ func (c *Client) Run(client *rpc.Client) error {
 					// if it's a hardlinked file, check that it's linked correctly
 					if remotefi.Nlink > 1 && c.PreserveHardlinks {
 						if ini, found := c.inodes.Load(inodeinfo{
+							dev:   remotefi.Dev,
 							inode: remotefi.Inode,
 						}); found {
 							otherlocalfi, err := PathToFileInfo(ini.path)
@@ -281,6 +272,7 @@ func (c *Client) Run(client *rpc.Client) error {
 				// try to hard link it
 				if create_file && c.PreserveHardlinks && remotefi.Nlink > 1 {
 					if ini, found := c.inodes.Load(inodeinfo{
+						dev:   remotefi.Dev,
 						inode: remotefi.Inode,
 					}); found {
 						if localpath != ini.path {
@@ -309,47 +301,14 @@ func (c *Client) Run(client *rpc.Client) error {
 					logger.Info().Msgf("Applying attributes to file %s", localpath)
 				}
 
-				var localfile *os.File
 				if create_file {
-					if remotefi.Mode&fs.ModeDevice != 0 {
-						if remotefi.Mode&fs.ModeCharDevice != 0 {
-							err = mkNod(localpath, syscall.S_IFCHR, remotefi.Rdev)
-							if err != nil {
-								logger.Error().Msgf("Error creating char device %s: %v", localpath, err)
-								continue
-							}
-						} else {
-							// Block device
-							err = mkNod(localpath, syscall.S_IFBLK, remotefi.Rdev)
-							if err != nil {
-								logger.Error().Msgf("Error creating block device %s: %v", localpath, err)
-								continue
-							}
-						}
-					} else if remotefi.Mode&fs.ModeNamedPipe != 0 {
-						err = mkNod(localpath, syscall.S_IFIFO, remotefi.Rdev)
-						if err != nil {
-							logger.Error().Msgf("Error creating fifo %s: %v", localpath, err)
-							continue
-						}
-					} else if remotefi.Mode&fs.ModeSocket != 0 {
-						err = mkNod(localpath, syscall.S_IFSOCK, remotefi.Rdev)
-						if err != nil {
-							logger.Error().Msgf("Error creating socket %s: %v", localpath, err)
-							continue
-						}
-					} else if remotefi.Mode&fs.ModeSymlink != 0 {
-						err = syscall.Symlink(remotefi.LinkTo, localpath)
-						if err != nil {
-							logger.Error().Msgf("Error creating symlink from %s to %s: %v", localpath, remotefi.LinkTo, err)
-							continue
-						}
-					} else {
-						localfile, err = os.Create(localpath)
-						if err != nil {
-							logger.Error().Msgf("Error creating local file %s: %v", localpath, err)
-							continue
-						}
+					err = localfi.Create(remotefi)
+					if err == ErrNotSupportedByPlatform {
+						logger.Warn().Msgf("Skipping %s: %v", localpath, err)
+						continue
+					} else if err != nil {
+						logger.Error().Msgf("Error creating %s: %v", localpath, err)
+						continue
 					}
 				}
 
@@ -359,15 +318,13 @@ func (c *Client) Run(client *rpc.Client) error {
 					var existingsize int64
 
 					// Open file if we didn't create it earlier
-					if localfile == nil {
-						localfile, err = os.OpenFile(localpath, os.O_RDWR, fs.FileMode(remotefi.Mode))
-						if err != nil {
-							logger.Error().Msgf("Error opening existing local file %s: %v", localpath, err)
-							continue
-						}
-						fi, _ := os.Stat(localpath)
-						existingsize = fi.Size()
+					localfile, err := os.OpenFile(localpath, os.O_RDWR, fs.FileMode(remotefi.Mode))
+					if err != nil {
+						logger.Error().Msgf("Error opening existing local file %s: %v", localpath, err)
+						continue
 					}
+					fi, _ := os.Stat(localpath)
+					existingsize = fi.Size()
 
 					err = client.Call("Server.Open", remotefi.Name, nil)
 					if err != nil {
@@ -441,8 +398,6 @@ func (c *Client) Run(client *rpc.Client) error {
 					if err != nil {
 						logger.Error().Msgf("Error closing remote file %s: %v", remotefi.Name, err)
 					}
-				}
-				if localfile != nil {
 					localfile.Close()
 				}
 
@@ -458,7 +413,10 @@ func (c *Client) Run(client *rpc.Client) error {
 				if remaininghardlinks == 0 {
 					// No more references, free up some memory
 					logger.Trace().Msgf("No more references to this inode, removing it from inode cache")
-					c.inodes.Delete(inodeinfo{inode: remotefi.Inode})
+					c.inodes.Delete(inodeinfo{
+						dev:   remotefi.Dev,
+						inode: remotefi.Inode,
+					})
 					deletedinodes++
 					if c.inodes.Len()/4 < deletedinodes {
 						deletedinodes = 0
@@ -489,10 +447,18 @@ func (c *Client) Run(client *rpc.Client) error {
 				}
 				if donewithdirectory {
 					localname := filepath.Join(c.BasePath, lookupdirectory.name)
-					localfi, err := PathToFileInfo(localname)
-					if localfi.Atim != atim || localfi.Mtim != mtim {
+					localfi, err = PathToFileInfo(localname)
+					if err != nil {
+						logger.Error().Msgf("Error getting metadata for local directory %s: %v", lookupdirectory.name, err)
+						continue
+					}
+					if localfi.Mtim != mtim {
 						logger.Trace().Msgf("Updating metadata for directory %s", localname)
-						err = unix.UtimesNanoAt(unix.AT_FDCWD, localname, []unix.Timespec{unix.Timespec(atim), unix.Timespec(mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+						setfi := FileInfo{
+							Atim: atim,
+							Mtim: mtim,
+						}
+						err = localfi.SetTimestamps(setfi)
 						if err != nil {
 							logger.Error().Msgf("Error changing times for directory %s: %v", lookupdirectory.name, err)
 						}
@@ -538,6 +504,10 @@ func (c *Client) Run(client *rpc.Client) error {
 	logger.Debug().Msg("Client routine done")
 
 	return nil
+}
+
+func (c *Client) Abort() {
+	c.shutdown = true
 }
 
 func (c *Client) Done() bool {

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"errors"
 	"io/fs"
 	"os"
 	"slices"
@@ -9,7 +9,11 @@ import (
 
 	"github.com/joshlf/go-acl"
 	"github.com/pkg/xattr"
-	unix "golang.org/x/sys/unix"
+)
+
+var (
+	ErrNotSupportedByPlatform = errors.New("not supported on this platform")
+	ErrTypeError              = errors.New("type error")
 )
 
 type FileInfo struct {
@@ -47,47 +51,32 @@ func InfoToFileInfo(info os.FileInfo, absolutepath string) (FileInfo, error) {
 		Size:  info.Size(),
 		IsDir: info.IsDir(),
 	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		fi.Inode = stat.Ino
-		fi.Nlink = uint64(stat.Nlink) // force to uint64 for 32-bit systems
-		fi.Dev = uint64(stat.Dev)
-		fi.Rdev = uint64(stat.Rdev)
-		fi.Owner = stat.Uid
-		fi.Group = stat.Gid
-		fi.Permissions = uint32(stat.Mode)
 
-		atim, mtim, ctim := getAMtime(*stat)
-		fi.Atim = atim
-		fi.Mtim = mtim
-		fi.Ctim = ctim
-
-		if fi.Mode&os.ModeSymlink != 0 {
-			logger.Trace().Msgf("Detected %v as symlink", fi.Name)
-			// Symlink - read link and store in fi variable
-			linkto := make([]byte, 65536)
-			n, err := syscall.Readlink(absolutepath, linkto)
-			if err != nil {
-				logger.Error().Msgf("Error reading link to %v: %v", fi.Name, err)
-			} else {
-				logger.Trace().Msgf("Detected %v as symlink to %v", fi.Name, string(linkto))
-			}
-			fi.LinkTo = string(linkto[0:n])
-		} else if fi.Mode&os.ModeCharDevice != 0 && fi.Mode&os.ModeDevice != 0 {
-			logger.Trace().Msgf("Detected %v as character device", fi.Name)
-		} else if fi.Mode&os.ModeDir != 0 {
-			logger.Trace().Msgf("Detected %v as directory", fi.Name)
-		} else if fi.Mode&os.ModeSocket != 0 {
-			logger.Trace().Msgf("Detected %v as socket", fi.Name)
-		} else if fi.Mode&os.ModeNamedPipe != 0 {
-			logger.Trace().Msgf("Detected %v as FIFO", fi.Name)
-		} else if fi.Mode&os.ModeDevice != 0 {
-			logger.Trace().Msgf("Detected %v as device", fi.Name)
+	if fi.Mode&os.ModeSymlink != 0 {
+		logger.Trace().Msgf("Detected %v as symlink", fi.Name)
+		// Symlink - read link and store in fi variable
+		linkto := make([]byte, 65536)
+		n, err := syscall.Readlink(absolutepath, linkto)
+		if err != nil {
+			logger.Error().Msgf("Error reading link to %v: %v", fi.Name, err)
 		} else {
-			logger.Trace().Msgf("Detected %v as regular file", fi.Name)
+			logger.Trace().Msgf("Detected %v as symlink to %v", fi.Name, string(linkto))
 		}
+		fi.LinkTo = string(linkto[0:n])
+	} else if fi.Mode&os.ModeCharDevice != 0 && fi.Mode&os.ModeDevice != 0 {
+		logger.Trace().Msgf("Detected %v as character device", fi.Name)
+	} else if fi.Mode&os.ModeDir != 0 {
+		logger.Trace().Msgf("Detected %v as directory", fi.Name)
+	} else if fi.Mode&os.ModeSocket != 0 {
+		logger.Trace().Msgf("Detected %v as socket", fi.Name)
+	} else if fi.Mode&os.ModeNamedPipe != 0 {
+		logger.Trace().Msgf("Detected %v as FIFO", fi.Name)
+	} else if fi.Mode&os.ModeDevice != 0 {
+		logger.Trace().Msgf("Detected %v as device", fi.Name)
 	} else {
-		return fi, fmt.Errorf("stat failed, I got a %T", info.Sys())
+		logger.Trace().Msgf("Detected %v as regular file", fi.Name)
 	}
+
 	if info.Mode()&os.ModeSymlink == 0 {
 		acl, err := acl.Get(absolutepath)
 		if err != nil && err.Error() != "operation not supported" {
@@ -110,13 +99,14 @@ func InfoToFileInfo(info os.FileInfo, absolutepath string) (FileInfo, error) {
 			}
 		}
 	}
-	// syscall.Getxattr(absolutepath, "security.capability", fi.Xattrs)
-	return fi, nil
+
+	err := fi.extractNativeInfo(info)
+	return fi, err
 }
 
-func (fi FileInfo) Compare(fi2 FileInfo) (different, requiresDelete bool) {
+func (fi FileInfo) Compare(fi2 FileInfo) (differences []string, requiresDelete bool) {
 	panic("not implemented")
-	return false, false
+	return nil, false
 }
 
 func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
@@ -178,7 +168,8 @@ func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 		}
 	}
 
-	err = unix.UtimesNanoAt(unix.AT_FDCWD, fi.Name, []unix.Timespec{unix.Timespec(fi2.Atim), unix.Timespec(fi2.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+	err = fi.SetTimestamps(fi2)
+
 	if err != nil {
 		logger.Error().Msgf("Error changing times for %s: %v", fi.Name, err)
 	}

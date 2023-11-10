@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"os/signal"
 	"runtime/pprof"
 	"strings"
 	"time"
@@ -44,7 +45,10 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		pprof.StartCPUProfile(f)
+		err = pprof.StartCPUProfile(f)
+		if err != nil {
+			logger.Fatal().Msgf("Can't start profiling: %v", err)
+		}
 		defer pprof.StopCPUProfile()
 	}
 
@@ -77,6 +81,10 @@ func main() {
 	if len(pflag.Args()) == 0 {
 		logger.Fatal().Msg("Need command argument")
 	}
+
+	// register signal handler
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
 
 	switch strings.ToLower(pflag.Arg(0)) {
 	case "server":

@@ -1,5 +1,5 @@
-//go:build !darwin && !freebsd
-// +build !darwin,!freebsd
+//go:build !darwin && !freebsd && !windows
+// +build !darwin,!freebsd,!windows
 
 package main
 
