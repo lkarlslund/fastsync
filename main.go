@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/rpc"
 	"os"
-	"os/signal"
+	"runtime"
+	"runtime/metrics"
 	"runtime/pprof"
 	"strings"
 	"time"
@@ -34,13 +36,67 @@ func main() {
 	transferblocksize := pflag.Int("blocksize", 128*1024, "Transfer/checksum block size")
 	// debugging etc
 	loglevel := pflag.String("loglevel", "info", "Log level")
-	cpuprofile := pflag.String("cpuprofile", "", "Write cpu profile to file")
+	cpuprofile := pflag.String("cpuprofile", "", "Write cpu profile to file (filename, use 'auto' to trigger auto profiling)")
+	cpuprofilelength := pflag.Int("cpuprofilelength", 0, "Stop profiling after N seconds, 0 to profile until program terminates")
 	transferstatsinterval := pflag.Int("statsinterval", 5, "Show transfer stats every N seconds, 0 to disable")
 	queuestatsinterval := pflag.Int("queueinterval", 30, "Show internal queue sizes every N seconds, 0 to disable")
 
 	pflag.Parse()
 
-	if *cpuprofile != "" {
+	if *cpuprofile == "auto" {
+		// auto profile
+		go func() {
+			// detect cpu usage
+			s := []metrics.Sample{
+				{Name: "/cpu/classes/user:cpu-seconds"},
+			}
+			var lastvalue float64
+			var loops, highmarks int
+			var autoprofiling bool
+			for {
+				time.Sleep(time.Second)
+				loops++
+				metrics.Read(s)
+				cpu := s[0].Value.Float64()
+				relative := cpu - lastvalue
+				if relative == 0 {
+					continue
+				}
+				lastvalue = cpu
+
+				percpu := relative / float64(runtime.NumCPU()) / float64(loops)
+				if percpu > 0.9 {
+					logger.Warn().Msg("CPU high instance detected")
+					highmarks++
+				} else if percpu < 0.6 {
+					highmarks = 0
+				}
+				loops = 0
+				logger.Warn().Msgf("CPU: %f, percpu %f", cpu, percpu)
+
+				if highmarks > 15 && !autoprofiling {
+					autoprofiling = true
+					highmarks = 0
+					logger.Warn().Msg("CPU high, auto profiling starting")
+					f, err := os.Create(fmt.Sprintf("cpu-autoprofile-%v.prof", time.Now()))
+					if err != nil {
+						log.Fatal(err)
+					}
+					err = pprof.StartCPUProfile(f)
+					if err != nil {
+						logger.Fatal().Msgf("Can't start profiling: %v", err)
+					}
+					go func() {
+						time.Sleep(time.Minute)
+						pprof.StopCPUProfile()
+						autoprofiling = false
+						f.Close()
+						logger.Warn().Msgf("CPU auto profiling stopped")
+					}()
+				}
+			}
+		}()
+	} else if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)
 		if err != nil {
 			log.Fatal(err)
@@ -49,7 +105,16 @@ func main() {
 		if err != nil {
 			logger.Fatal().Msgf("Can't start profiling: %v", err)
 		}
-		defer pprof.StopCPUProfile()
+		if *cpuprofilelength > 0 {
+			go func() {
+				time.Sleep(time.Duration(*cpuprofilelength) * time.Second)
+				pprof.StopCPUProfile()
+				f.Close()
+				logger.Warn().Msgf("CPU profiling stopped")
+			}()
+		} else {
+			defer pprof.StopCPUProfile()
+		}
 	}
 
 	var err error
