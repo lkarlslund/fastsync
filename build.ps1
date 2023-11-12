@@ -30,4 +30,4 @@ function BuildVariants {
 Set-Location $PSScriptRoot
 
 # Release
-BuildVariants -ldflags "$LDFLAGS -s" -prefix fastsync -path . -arch @("386", "amd64", "arm64") -os @("linux", "openbsd", "darwin", "freebsd")
+BuildVariants -ldflags "$LDFLAGS -s" -prefix fastsync -path . -arch @("386", "amd64", "arm64") -os @("linux", "openbsd", "darwin", "freebsd", "windows")
