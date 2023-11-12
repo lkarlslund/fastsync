@@ -11,32 +11,39 @@ import (
 	unix "golang.org/x/sys/unix"
 )
 
-func (f FileInfo) Create(remotefi FileInfo) error {
-	if remotefi.Mode&fs.ModeDevice != 0 {
-		if remotefi.Mode&fs.ModeCharDevice != 0 {
-			return mkNod(f.Name, syscall.S_IFCHR, remotefi.Rdev)
+func (fi FileInfo) Create(fi2 FileInfo) error {
+	if fi2.Mode&fs.ModeDevice != 0 {
+		if fi2.Mode&fs.ModeCharDevice != 0 {
+			return mkNod(fi.Name, syscall.S_IFCHR, fi2.Rdev)
 		} else {
 			// Block device
-			return mkNod(f.Name, syscall.S_IFBLK, remotefi.Rdev)
+			return mkNod(fi.Name, syscall.S_IFBLK, fi2.Rdev)
 		}
-	} else if remotefi.Mode&fs.ModeNamedPipe != 0 {
-		return mkNod(f.Name, syscall.S_IFIFO, remotefi.Rdev)
-	} else if remotefi.Mode&fs.ModeSocket != 0 {
-		return mkNod(f.Name, syscall.S_IFSOCK, remotefi.Rdev)
-	} else if remotefi.Mode&fs.ModeSymlink != 0 {
-		return syscall.Symlink(remotefi.LinkTo, f.Name)
+	} else if fi2.Mode&fs.ModeNamedPipe != 0 {
+		return mkNod(fi.Name, syscall.S_IFIFO, fi2.Rdev)
+	} else if fi2.Mode&fs.ModeSocket != 0 {
+		return mkNod(fi.Name, syscall.S_IFSOCK, fi2.Rdev)
+	} else if fi2.Mode&fs.ModeSymlink != 0 {
+		return syscall.Symlink(fi2.LinkTo, fi.Name)
 	}
-	file, err := os.Create(f.Name)
-	defer file.Close()
+	file, err := os.Create(fi.Name)
+	if err == nil {
+		file.Close()
+	}
 	return err
 }
 
-func (f FileInfo) SetTimestamps(fi2 FileInfo) error {
-	return unix.UtimesNanoAt(unix.AT_FDCWD, f.Name, []unix.Timespec{unix.Timespec(fi2.Atim), unix.Timespec(fi2.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+func (fi *FileInfo) Chown(fi2 FileInfo) error {
+	return os.Lchown(fi.Name, int(fi2.Owner), int(fi2.Group))
 }
 
-func (f FileInfo) Chmod(fi2 FileInfo) error {
-	return unix.Fchmodat(unix.AT_FDCWD, f.Name, fi2.Permissions, unix.AT_SYMLINK_NOFOLLOW)
+func (fi FileInfo) SetTimestamps(fi2 FileInfo) error {
+	return unix.UtimesNanoAt(unix.AT_FDCWD, fi.Name, []unix.Timespec{unix.Timespec(fi2.Atim), unix.Timespec(fi2.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+}
+
+func (fi FileInfo) Chmod(fi2 FileInfo) error {
+	return unix.Chmod(fi.Name, fi2.Permissions)
+	// return unix.Fchmodat(unix.AT_FDCWD, f.Name, fi2.Permissions, unix.AT_SYMLINK_NOFOLLOW)
 }
 
 func (fi *FileInfo) extractNativeInfo(fsfi fs.FileInfo) error {

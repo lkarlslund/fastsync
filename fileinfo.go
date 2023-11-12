@@ -111,10 +111,12 @@ func (fi FileInfo) Compare(fi2 FileInfo) (differences []string, requiresDelete b
 
 func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 	logger.Debug().Msgf("Updating metadata for %s", fi.Name)
-	err := os.Lchown(fi.Name, int(fi2.Owner), int(fi2.Group))
-	if err != nil {
+
+	err := fi.Chown(fi2)
+	if err != nil && err != ErrNotSupportedByPlatform {
 		logger.Error().Msgf("Error changing owner for %s: %v", fi.Name, err)
 	}
+
 	if fi2.Mode&fs.ModeSymlink == 0 {
 		// err = unix.Chmod(fi.Name, fi2.Permissions)
 		err = os.Chmod(fi.Name, fi2.Mode)

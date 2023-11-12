@@ -43,6 +43,10 @@ type FILE_ATTRIBUTE_TAG_INFO struct {
 
 const FileAttributeTagInfo = 9
 
+func (f *FileInfo) Chown(fi2 FileInfo) error {
+	return ErrNotSupportedByPlatform
+}
+
 func (f *FileInfo) extractNativeInfo(fsfi fs.FileInfo) error {
 	native, ok := fsfi.Sys().(*syscall.Win32FileAttributeData)
 	if !ok {

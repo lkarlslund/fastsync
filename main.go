@@ -84,7 +84,7 @@ func main() {
 
 	// register signal handler
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
+	// signal.Notify(signals, os.Interrupt)
 
 	switch strings.ToLower(pflag.Arg(0)) {
 	case "server":
@@ -121,6 +121,10 @@ func main() {
 					logger.Info().Msgf("Closed connection from %v", conn.RemoteAddr())
 				}()
 			}
+		}()
+		go func() {
+			<-signals
+			serverobject.Shutdown(nil, nil)
 		}()
 		serverobject.Wait()
 	case "client", "shutdown":
@@ -184,6 +188,10 @@ func main() {
 			}()
 		}
 
+		go func() {
+			<-signals
+			c.Abort()
+		}()
 		err = c.Run(rpcClient)
 		if err != nil {
 			logger.Error().Msgf("Error running client: %v", err)

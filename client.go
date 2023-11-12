@@ -15,9 +15,10 @@ import (
 )
 
 type inodeinfo struct {
-	dev, inode uint64
-	path       string
-	remaining  int32
+	dev, inode           uint64
+	localhardlinkpath    string
+	localdev, localinode uint64
+	remaining            int32
 }
 
 func (i inodeinfo) LessThan(i2 inodeinfo) bool {
@@ -173,22 +174,6 @@ func (c *Client) Run(client *rpc.Client) error {
 				copy_verify_file := false // do we need to copy it
 				apply_attributes := false // do we need to update owner etc.
 
-				remaininghardlinks := int32(-1) // not relevant
-				if c.PreserveHardlinks && remotefi.Nlink > 1 {
-					logger.Trace().Msgf("Saving/updating remote inode number %v to cache for file %s with %d hardlinks", remotefi.Inode, remotefi.Name, remotefi.Nlink)
-					c.inodes.AtomicMutate(inodeinfo{
-						dev:       remotefi.Dev,
-						inode:     remotefi.Inode,
-						path:      localpath,
-						remaining: int32(remotefi.Nlink),
-					}, func(i *inodeinfo) {
-						remaininghardlinks = atomic.AddInt32(&i.remaining, -1)
-						if remaininghardlinks == int32(remotefi.Nlink-1) {
-							logger.Trace().Msgf("Added file %s to inode cache", remotefi.Name)
-						}
-					}, true)
-				}
-
 				localfi, err := PathToFileInfo(localpath)
 				if err != nil {
 					if os.IsNotExist(err) {
@@ -201,63 +186,102 @@ func (c *Client) Run(client *rpc.Client) error {
 					}
 				}
 
-				if !create_file {
-					// if it's a hardlinked file, check that it's linked correctly
-					if remotefi.Nlink > 1 && c.PreserveHardlinks {
-						if ini, found := c.inodes.Load(inodeinfo{
-							dev:   remotefi.Dev,
-							inode: remotefi.Inode,
-						}); found {
-							otherlocalfi, err := PathToFileInfo(ini.path)
-							if err != nil {
-								logger.Error().Msgf("Error getting hardlink stat for local path %s: %v", localpath, err)
-								continue
-							}
+				remaininghardlinks := int32(-1) // not relevant
+				var justaddedtoinodecache bool
+				if c.PreserveHardlinks && remotefi.Nlink > 1 {
+					logger.Trace().Msgf("Saving/updating remote dev/inode number %v to cache for file %s with %d hardlinks", remotefi.Dev, remotefi.Inode, remotefi.Name, remotefi.Nlink)
+					c.inodes.AtomicMutate(inodeinfo{
+						dev:               remotefi.Dev,
+						inode:             remotefi.Inode,
+						localhardlinkpath: localpath,
+						remaining:         int32(remotefi.Nlink),
+					}, func(i *inodeinfo) {
+						remaininghardlinks = atomic.AddInt32(&i.remaining, -1)
+						if remaininghardlinks == int32(remotefi.Nlink-1) {
+							logger.Trace().Msgf("Added file %s to inode cache", remotefi.Name)
+							justaddedtoinodecache = true
+						}
+						if !create_file && atomic.CompareAndSwapUint64(&i.localinode, localfi.Inode, 0) {
+							logger.Trace().Msgf("Updated local inode for file %s", remotefi.Name)
+							atomic.SwapUint64(&i.localdev, localfi.Dev)
+						}
+					}, true)
+				}
 
-							if localfi.Inode != otherlocalfi.Inode {
-								logger.Debug().Msgf("Hardlink %s and %s have different inodes but should match, unlinking file", localpath, ini.path)
-								err = os.Remove(localpath)
-								if err != nil {
-									logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
+				// if it's a hardlinked file, check that it's linked correctly
+				if !create_file && remotefi.Nlink > 1 && c.PreserveHardlinks && !justaddedtoinodecache {
+					if ini, found := c.inodes.Load(inodeinfo{
+						dev:   remotefi.Dev,
+						inode: remotefi.Inode,
+					}); found {
+						if ini.localinode == 0 {
+							// Find the local inode, we only need to do this once
+							for {
+								otherlocalfi, err := PathToFileInfo(ini.localhardlinkpath)
+								if os.IsNotExist(err) {
+									logger.Warn().Msgf("Local hardlink path %s does not exist, delaying a bit", ini.localhardlinkpath)
+									time.Sleep(10 * time.Millisecond)
+								} else if err != nil {
+									logger.Error().Msgf("Error getting hardlink stat for local path %s: %v", ini.localhardlinkpath, err)
 									continue
+								} else {
+									c.inodes.AtomicMutate(inodeinfo{
+										dev:   remotefi.Dev,
+										inode: remotefi.Inode,
+									}, func(i *inodeinfo) {
+										if atomic.CompareAndSwapUint64(&i.localinode, otherlocalfi.Inode, 0) {
+											atomic.SwapUint64(&i.localdev, otherlocalfi.Dev)
+											ini = *i
+										}
+									}, false)
+									break
 								}
-								create_file = true
 							}
 						}
+
+						if localfi.Inode != ini.localinode || localfi.Dev != ini.localdev {
+							logger.Debug().Msgf("Hardlink %s and %s have different inodes but should match, unlinking file", localpath, ini.localhardlinkpath)
+							err = os.Remove(localpath)
+							if err != nil {
+								logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
+								continue
+							}
+							create_file = true
+						}
+					}
+				}
+
+				if !create_file && localfi.Mode&os.ModeType != remotefi.Mode&os.ModeType {
+					logger.Debug().Msgf("File %s is indicating type change from %v to %v, unlinking", localpath, localfi.Mode.String(), remotefi.Mode.String())
+					err = os.Remove(localpath)
+					if err != nil {
+						logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
+						continue
 					}
 
-					if !create_file && localfi.Mode&os.ModeType != remotefi.Mode&os.ModeType {
-						logger.Debug().Msgf("File %s is indicating type change from %v to %v, unlinking", localpath, localfi.Mode.String(), remotefi.Mode.String())
-						err = os.Remove(localpath)
+					create_file = true
+				}
+
+				if !create_file { // still exists
+					if localfi.Size > remotefi.Size && remotefi.Mode&fs.ModeSymlink == 0 {
+						logger.Debug().Msgf("File %s is indicating size change from %v to %v, truncating", localpath, localfi.Size, remotefi.Size)
+						err = os.Truncate(localpath, int64(remotefi.Size))
 						if err != nil {
-							logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
+							logger.Error().Msgf("Error truncating %s to %v bytes to match remote: %v", localpath, remotefi.Size, err)
 							continue
 						}
-
-						create_file = true
+						apply_attributes = true
+					}
+					if localfi.Mtim.Nano() != remotefi.Mtim.Nano() {
+						logger.Debug().Msgf("File %s is indicating time change from %v to %v, applying attribute changes", localpath, time.Unix(0, localfi.Mtim.Nano()), time.Unix(0, remotefi.Mtim.Nano()))
+						apply_attributes = true
 					}
 
-					if !create_file { // still exists
-						if localfi.Size > remotefi.Size && remotefi.Mode&fs.ModeSymlink == 0 {
-							logger.Debug().Msgf("File %s is indicating size change from %v to %v, truncating", localpath, localfi.Size, remotefi.Size)
-							err = os.Truncate(localpath, int64(remotefi.Size))
-							if err != nil {
-								logger.Error().Msgf("Error truncating %s to %v bytes to match remote: %v", localpath, remotefi.Size, err)
-								continue
-							}
-							apply_attributes = true
-						}
-						if localfi.Mtim.Nano() != remotefi.Mtim.Nano() {
-							logger.Debug().Msgf("File %s is indicating time change from %v to %v, applying attribute changes", localpath, time.Unix(0, localfi.Mtim.Nano()), time.Unix(0, remotefi.Mtim.Nano()))
-							apply_attributes = true
-						}
-
-						if localfi.Mode.Perm() != remotefi.Mode.Perm() || localfi.Owner != remotefi.Owner || localfi.Group != remotefi.Group {
-							logger.Debug().Msgf("File %s is indicating permissions changes, applying attribute changes", localpath)
-							apply_attributes = true
-						}
-
+					if localfi.Mode.Perm() != remotefi.Mode.Perm() || localfi.Owner != remotefi.Owner || localfi.Group != remotefi.Group {
+						logger.Debug().Msgf("File %s is indicating permissions changes, applying attribute changes", localpath)
+						apply_attributes = true
 					}
+
 				}
 
 				if create_file {
@@ -270,16 +294,16 @@ func (c *Client) Run(client *rpc.Client) error {
 				}
 
 				// try to hard link it
-				if create_file && c.PreserveHardlinks && remotefi.Nlink > 1 {
+				if create_file && c.PreserveHardlinks && remotefi.Nlink > 1 && !justaddedtoinodecache {
 					if ini, found := c.inodes.Load(inodeinfo{
 						dev:   remotefi.Dev,
 						inode: remotefi.Inode,
 					}); found {
-						if localpath != ini.path {
-							logger.Debug().Msgf("Hardlinking %s to %s", localpath, ini.path)
-							err = os.Link(filepath.Join(ini.path), localpath)
+						if localpath != ini.localhardlinkpath {
+							logger.Debug().Msgf("Hardlinking %s to %s", localpath, ini.localhardlinkpath)
+							err = os.Link(filepath.Join(ini.localhardlinkpath), localpath)
 							if err != nil {
-								logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.path, err)
+								logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.localhardlinkpath, err)
 								continue
 							}
 							create_file = false
@@ -512,7 +536,6 @@ func (c *Client) Abort() {
 
 func (c *Client) Done() bool {
 	return c.done
-
 }
 
 func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
