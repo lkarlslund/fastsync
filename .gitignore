@@ -1,3 +1,5 @@
 ﻿fastsync
 binaries/*
 .vscode
+fastsync.exe
+*.pprof
