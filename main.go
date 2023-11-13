@@ -231,7 +231,7 @@ func main() {
 				for !c.Done() {
 					time.Sleep(time.Duration(*transferstatsinterval) * time.Second)
 					lasthistory := p.NextHistory()
-					logger.Info().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v dirs/sec",
+					logger.Warn().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v dirs/sec",
 						humanize.Bytes((lasthistory.counters[SentOverWire]+lasthistory.counters[RecievedOverWire])/uint64(*transferstatsinterval)),
 						humanize.Bytes((lasthistory.counters[SentBytes]+lasthistory.counters[RecievedBytes])/uint64(*transferstatsinterval)),
 						humanize.Bytes((lasthistory.counters[ReadBytes]+lasthistory.counters[WrittenBytes])/uint64(*transferstatsinterval)),
@@ -247,7 +247,7 @@ func main() {
 				for !c.Done() {
 					time.Sleep(time.Duration(*queuestatsinterval) * time.Second)
 					inodecache, directorycache, files, stack := c.Stats()
-					logger.Info().Msgf("Inode cache %v, directory cache %v, file queue %v, directory queue %v",
+					logger.Warn().Msgf("Inode cache %v, directory cache %v, file queue %v, directory queue %v",
 						inodecache, directorycache, files, stack)
 				}
 			}()
