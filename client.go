@@ -69,9 +69,6 @@ func NewClient() *Client {
 
 func (c *Client) Run(client *rpc.Client) error {
 	// Start the process
-
-	var deletedinodes int
-
 	var listfilesActive sync.WaitGroup
 
 	c.dirstack, c.dirqueueout, c.dirqueuein = NewStack[FileInfo](c.ParallelDir*2, 8)
@@ -189,7 +186,7 @@ func (c *Client) Run(client *rpc.Client) error {
 				remaininghardlinks := int32(-1) // not relevant
 				var justaddedtoinodecache bool
 				if c.PreserveHardlinks && remotefi.Nlink > 1 {
-					logger.Trace().Msgf("Saving/updating remote dev/inode number %v to cache for file %s with %d hardlinks", remotefi.Dev, remotefi.Inode, remotefi.Name, remotefi.Nlink)
+					logger.Trace().Msgf("Saving/updating remote dev/inode number %v/%v to cache for file %s with %d hardlinks", remotefi.Dev, remotefi.Inode, remotefi.Name, remotefi.Nlink)
 					c.inodes.AtomicMutate(inodeinfo{
 						dev:               remotefi.Dev,
 						inode:             remotefi.Inode,
@@ -441,11 +438,6 @@ func (c *Client) Run(client *rpc.Client) error {
 						dev:   remotefi.Dev,
 						inode: remotefi.Inode,
 					})
-					deletedinodes++
-					if c.inodes.Len()/4 < deletedinodes {
-						deletedinodes = 0
-						c.inodes.Optimize(gonk.Minimize)
-					}
 				}
 
 				// are we done with this directory, the apply attributes to that
