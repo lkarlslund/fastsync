@@ -301,9 +301,23 @@ func (c *Client) Run(client *rpc.Client) error {
 					}); found {
 						if localpath != ini.localhardlinkpath {
 							logger.Debug().Msgf("Hardlinking %s to %s", localpath, ini.localhardlinkpath)
-							err = os.Link(filepath.Join(ini.localhardlinkpath), localpath)
+							var retries int
+							for {
+								err = os.Link(ini.localhardlinkpath, localpath)
+								if err != nil {
+									if os.IsNotExist(err) {
+										retries++
+										if retries < 25 {
+											time.Sleep(100 * time.Millisecond)
+											continue
+										}
+									}
+									logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.localhardlinkpath, err)
+									break
+								}
+								break
+							}
 							if err != nil {
-								logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, ini.localhardlinkpath, err)
 								continue
 							}
 							create_file = false
