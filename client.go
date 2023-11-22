@@ -318,11 +318,11 @@ func (c *Client) Run(client *rpc.Client) error {
 				transfersuccess := true
 
 				if create_file {
-					logger.Info().Msgf("Creating file %s", localpath)
+					logger.Debug().Msgf("Creating file %s", localpath)
 				} else if copy_verify_file {
-					logger.Info().Msgf("Updating/verifying file %s", localpath)
+					logger.Debug().Msgf("Updating/verifying file %s", localpath)
 				} else if apply_attributes {
-					logger.Info().Msgf("Applying attributes to file %s", localpath)
+					logger.Debug().Msgf("Applying attributes to file %s", localpath)
 				}
 
 				if create_file {
