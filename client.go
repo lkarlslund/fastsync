@@ -39,7 +39,9 @@ func (f dirinfo) LessThan(f2 dirinfo) bool {
 type Client struct {
 	BasePath string
 
-	AlwaysChecksum            bool
+	AlwaysChecksum bool
+	SendACL        bool
+
 	ParallelFile, ParallelDir int
 	PreserveHardlinks         bool
 	BlockSize                 int
@@ -181,6 +183,12 @@ func (c *Client) Run(client *rpc.Client) error {
 						logger.Error().Msgf("Error getting fileinfo for local path %s: %v", localpath, err)
 						continue
 					}
+				}
+
+				// Ignore it
+				if !c.SendACL {
+					localfi.ACL = nil
+					remotefi.ACL = nil
 				}
 
 				remaininghardlinks := int32(-1) // not relevant

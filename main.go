@@ -29,6 +29,8 @@ func main() {
 	bind := pflag.String("bind", "0.0.0.0:7331", "Address to bind/connect to")
 	hardlinks := pflag.Bool("hardlinks", true, "Preserve hardlinks")
 	directory := pflag.String("directory", ".", "Directory to use as source or target")
+	// transfer decision settings
+	acl := pflag.Bool("acl", true, "Transfer ACLs")
 	checksum := pflag.Bool("checksum", false, "Checksum files")
 	// performance settings
 	parallelfile := pflag.Int("pfile", 4096, "Number of parallel file IO operations")
@@ -225,12 +227,16 @@ func main() {
 		c.ParallelFile = *parallelfile
 		c.BlockSize = *transferblocksize
 		c.AlwaysChecksum = *checksum
+		c.SendACL = *acl
+
+		var totalhistory performanceentry
 
 		if *transferstatsinterval > 0 {
 			go func() {
 				for !c.Done() {
 					time.Sleep(time.Duration(*transferstatsinterval) * time.Second)
 					lasthistory := p.NextHistory()
+					totalhistory = totalhistory.Add(lasthistory)
 					logger.Warn().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v dirs/sec",
 						humanize.Bytes((lasthistory.counters[SentOverWire]+lasthistory.counters[RecievedOverWire])/uint64(*transferstatsinterval)),
 						humanize.Bytes((lasthistory.counters[SentBytes]+lasthistory.counters[RecievedBytes])/uint64(*transferstatsinterval)),
@@ -263,6 +269,17 @@ func main() {
 		}
 
 		rpcClient.Close()
+
+		lasthistory := p.NextHistory()
+		totalhistory = totalhistory.Add(lasthistory)
+		logger.Warn().Msgf("Final statistics\nWired %v, transferred %v, local read/write %v processed %v - %v files - %v dirs",
+			humanize.Bytes(totalhistory.counters[SentOverWire]+totalhistory.counters[RecievedOverWire]),
+			humanize.Bytes(totalhistory.counters[SentBytes]+totalhistory.counters[RecievedBytes]),
+			humanize.Bytes(totalhistory.counters[ReadBytes]+totalhistory.counters[WrittenBytes]),
+			humanize.Bytes(totalhistory.counters[BytesProcessed]),
+			totalhistory.counters[FilesProcessed],
+			totalhistory.counters[DirectoriesProcessed])
+
 	default:
 		logger.Fatal().Msgf("Invalid mode: %v", pflag.Arg(0))
 	}

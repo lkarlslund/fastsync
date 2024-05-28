@@ -63,6 +63,14 @@ type performanceentry struct {
 	counters [maxperformancecountertype]uint64
 }
 
+func (pe performanceentry) Add(pe2 performanceentry) performanceentry {
+	var result performanceentry
+	for i := 0; i < int(maxperformancecountertype); i++ {
+		result.counters[i] = pe.counters[i] + pe2.counters[i]
+	}
+	return result
+}
+
 type performance struct {
 	current    atomic.Pointer[performanceentry]
 	maxhistory int
