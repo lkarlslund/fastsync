@@ -112,16 +112,19 @@ func (fi FileInfo) Compare(fi2 FileInfo) (differences []string, requiresDelete b
 func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 	logger.Debug().Msgf("Updating metadata for %s", fi.Name)
 
-	err := fi.Chown(fi2)
-	if err != nil && err != ErrNotSupportedByPlatform {
-		logger.Error().Msgf("Error changing owner for %s: %v", fi.Name, err)
+	if fi.Owner != fi2.Owner || fi.Group != fi2.Group {
+		err := fi.Chown(fi2)
+		if err != nil && err != ErrNotSupportedByPlatform {
+			logger.Error().Msgf("Error changing owner for %s: %v", fi.Name, err)
+		}
 	}
 
 	if fi2.Mode&fs.ModeSymlink == 0 {
-		// err = unix.Chmod(fi.Name, fi2.Permissions)
-		err = os.Chmod(fi.Name, fi2.Mode)
-		if err != nil {
-			logger.Error().Msgf("Error changing mode for %s: %v", fi.Name, err)
+		if uint32(fi.Mode)&^uint32(os.ModePerm) != fi2.Permissions&^uint32(os.ModePerm) {
+			err := fi.Chmod(fi2)
+			if err != nil {
+				logger.Error().Msgf("Error changing mode for %s: %v", fi.Name, err)
+			}
 		}
 
 		if len(fi2.ACL) > 0 {
@@ -143,7 +146,7 @@ func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 				// delete attribute that do not exist in fi2
 				for attr := range fi.Xattrs {
 					if _, found := fi2.Xattrs[attr]; !found {
-						err = xattr.LRemove(fi.Name, attr)
+						err := xattr.LRemove(fi.Name, attr)
 						if err != nil {
 							logger.Error().Msgf("Error removing Xattr %v for %s: %v", attr, fi.Name, err)
 						}
@@ -155,13 +158,13 @@ func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 			for attr, values := range fi2.Xattrs {
 				if localvalues, found := fi.Xattrs[attr]; found {
 					if !slices.Equal(localvalues, values) {
-						err = xattr.LSet(fi.Name, attr, values)
+						err := xattr.LSet(fi.Name, attr, values)
 						if err != nil {
 							logger.Error().Msgf("Error setting Xattr %v for %s: %v", attr, fi.Name, err)
 						}
 					}
 				} else {
-					err = xattr.LSet(fi.Name, attr, values)
+					err := xattr.LSet(fi.Name, attr, values)
 					if err != nil {
 						logger.Error().Msgf("Error setting Xattr %v for %s: %v", attr, fi.Name, err)
 					}
@@ -170,10 +173,11 @@ func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 		}
 	}
 
-	err = fi.SetTimestamps(fi2)
-
-	if err != nil {
-		logger.Error().Msgf("Error changing times for %s: %v", fi.Name, err)
+	if fi.Mtim != fi2.Mtim {
+		err := fi.SetTimestamps(fi2)
+		if err != nil {
+			logger.Error().Msgf("Error changing times for %s: %v", fi.Name, err)
+		}
 	}
 
 	return nil

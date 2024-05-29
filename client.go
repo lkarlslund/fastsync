@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -26,10 +25,10 @@ func (i inodeinfo) LessThan(i2 inodeinfo) bool {
 }
 
 type dirinfo struct {
-	name      string
-	atim      syscall.Timespec
-	mtim      syscall.Timespec
-	remaining int32
+	name         string
+	info         FileInfo
+	extraentries []string // files/folders that are local only, and should be deleted
+	remaining    int32
 }
 
 func (f dirinfo) LessThan(f2 dirinfo) bool {
@@ -41,6 +40,7 @@ type Client struct {
 
 	AlwaysChecksum bool
 	SendACL        bool
+	Delete         bool
 
 	ParallelFile, ParallelDir int
 	PreserveHardlinks         bool
@@ -87,20 +87,39 @@ func (c *Client) Run(client *rpc.Client) error {
 				err := client.Call("Server.List", item.Name, &filelistresponse)
 				logger.Trace().Msgf("Listfiles response: %v, err: %v", filelistresponse, err)
 				if err != nil {
-					logger.Error().Msgf("Error listing files in %v: %v", item.Name, err)
+					logger.Error().Msgf("Error listing remote files in %v: %v", item.Name, err)
 					continue
 				}
+
 				var filecount int
+				remotenames := map[string]struct{}{}
 				for _, remotefi := range filelistresponse.Files {
+					remotenames[remotefi.Name] = struct{}{}
 					if !remotefi.IsDir {
 						filecount++
 					}
 				}
+
+				var extraentries []string
+				if c.Delete {
+					localentries, err := os.ReadDir(filepath.Join(c.BasePath, item.Name))
+					if err != nil {
+						logger.Error().Msgf("Error listing local files in %v: %v", item.Name, err)
+					} else {
+						for _, le := range localentries {
+							if _, found := remotenames[filepath.Join(item.Name, le.Name())]; !found {
+								extraentries = append(extraentries, le.Name())
+							}
+						}
+					}
+				}
+
 				var directoryfound bool
 				c.dircache.AtomicMutate(dirinfo{
 					name: item.Name,
 				}, func(f *dirinfo) {
 					atomic.StoreInt32(&f.remaining, int32(filecount))
+					f.extraentries = extraentries
 					directoryfound = true
 				}, false)
 				if !directoryfound {
@@ -122,32 +141,35 @@ func (c *Client) Run(client *rpc.Client) error {
 						// logger.Trace().Msgf("Queueing directory %s", remotefi.Name)
 						// check if directory exists
 						localstat, err := PathToFileInfo(localpath)
-						if err != nil {
+						if os.IsNotExist(err) {
 							logger.Trace().Msgf("Creating directory %s", localpath)
 							err = os.MkdirAll(localpath, 0755)
 							if err != nil {
 								logger.Error().Msgf("Error creating directory %v: %v", localpath, err)
 								continue
 							}
-							localstat, err = PathToFileInfo(localpath)
-							if err != nil {
-								logger.Error().Msgf("Error getting stat for newly created directory %v: %v", localpath, err)
-								continue
+						} else if err == nil {
+							if !localstat.IsDir {
+								logger.Debug().Msgf("Existing target for directory %v is not a directory, deleteing it", localpath)
+								err = os.RemoveAll(localpath)
+								if err != nil {
+									logger.Error().Msgf("Error removing path %v: %v", localpath, err)
+								}
+								logger.Trace().Msgf("Creating directory %s", localpath)
+								err = os.MkdirAll(localpath, 0755)
+								if err != nil {
+									logger.Error().Msgf("Error creating directory %v: %v", localpath, err)
+									continue
+								}
 							}
+						} else {
+							logger.Warn().Msgf("Error getting information about path %v: %v", localpath, err)
 						}
-						if uint32(localstat.Mode)&^uint32(os.ModePerm) != remotefi.Permissions&^uint32(os.ModePerm) {
-							err = localstat.Chmod(remotefi)
-							if err != nil {
-								logger.Error().Msgf("Error setting permissions for directory %v: %v", localpath, err)
-							}
-						}
-
 						logger.Trace().Msgf("Queueing directory %v", remotefi.Name)
 						listfilesActive.Add(1)
 						c.dircache.Store(dirinfo{
 							name:      remotefi.Name,
-							atim:      remotefi.Atim,
-							mtim:      remotefi.Mtim,
+							info:      remotefi,
 							remaining: -1, // we don't know yet
 						})
 						c.dirqueuein <- remotefi
@@ -468,15 +490,29 @@ func (c *Client) Run(client *rpc.Client) error {
 				lookupdirectory := dirinfo{
 					name: filepath.Dir(remotefi.Name),
 				}
-				var atim, mtim syscall.Timespec
 				c.dircache.AtomicMutate(lookupdirectory, func(item *dirinfo) {
 					founddirectory = true
 					left := atomic.AddInt32(&item.remaining, -1)
 					logger.Trace().Msgf("directory %s has usage %v left", item.name, left)
 					if left == 0 {
+						if c.Delete {
+							for _, extraentry := range item.extraentries {
+								err := os.RemoveAll(filepath.Join(c.BasePath, item.name, extraentry))
+								if err != nil {
+									logger.Error().Msgf("Error unlinking %v: %v", filepath.Join(c.BasePath, item.name, extraentry), err)
+								}
+								p.Add(EntriesDeleted, 1)
+							}
+						}
+
 						// Apply modify times to directory
-						atim = item.atim
-						mtim = item.mtim
+						localdirfi, err := PathToFileInfo(filepath.Join(c.BasePath, item.name))
+						if err != nil {
+							logger.Error().Msgf("Problem getting local directory information for %v: %v", filepath.Join(c.BasePath, item.name), err)
+						} else {
+							localdirfi.ApplyChanges(item.info)
+						}
+
 						donewithdirectory = true
 					}
 				}, false)
@@ -484,23 +520,6 @@ func (c *Client) Run(client *rpc.Client) error {
 					logger.Error().Msgf("Failed to find directory info for postprocessing %s", lookupdirectory.name)
 				}
 				if donewithdirectory {
-					localname := filepath.Join(c.BasePath, lookupdirectory.name)
-					localfi, err = PathToFileInfo(localname)
-					if err != nil {
-						logger.Error().Msgf("Error getting metadata for local directory %s: %v", lookupdirectory.name, err)
-						continue
-					}
-					if localfi.Mtim != mtim {
-						logger.Trace().Msgf("Updating metadata for directory %s", localname)
-						setfi := FileInfo{
-							Atim: atim,
-							Mtim: mtim,
-						}
-						err = localfi.SetTimestamps(setfi)
-						if err != nil {
-							logger.Error().Msgf("Error changing times for directory %s: %v", lookupdirectory.name, err)
-						}
-					}
 					c.dircache.Delete(lookupdirectory)
 				}
 				p.Add(FilesProcessed, 1)
@@ -521,8 +540,6 @@ func (c *Client) Run(client *rpc.Client) error {
 	listfilesActive.Add(1)
 	c.dircache.Store(dirinfo{
 		name:      rootdirinfo.Name,
-		atim:      rootdirinfo.Atim,
-		mtim:      rootdirinfo.Mtim,
 		remaining: -1,
 	})
 	c.dirqueuein <- rootdirinfo

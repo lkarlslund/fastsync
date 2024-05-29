@@ -32,6 +32,7 @@ func main() {
 	// transfer decision settings
 	acl := pflag.Bool("acl", true, "Transfer ACLs")
 	checksum := pflag.Bool("checksum", false, "Checksum files")
+	delete := pflag.Bool("delete", false, "Delete extra local files (mirror)")
 	// performance settings
 	parallelfile := pflag.Int("pfile", 4096, "Number of parallel file IO operations")
 	paralleldir := pflag.Int("pdir", 512, "Number of parallel dir scanning operations")
@@ -228,6 +229,7 @@ func main() {
 		c.BlockSize = *transferblocksize
 		c.AlwaysChecksum = *checksum
 		c.SendACL = *acl
+		c.Delete = *delete
 
 		var totalhistory performanceentry
 
@@ -272,13 +274,15 @@ func main() {
 
 		lasthistory := p.NextHistory()
 		totalhistory = totalhistory.Add(lasthistory)
-		logger.Warn().Msgf("Final statistics\nWired %v, transferred %v, local read/write %v processed %v - %v files - %v dirs",
+		logger.Warn().Msgf("Final statistics")
+		logger.Warn().Msgf("Wired %v, transferred %v, local read/write %v processed %v - %v files - %v dirs",
 			humanize.Bytes(totalhistory.counters[SentOverWire]+totalhistory.counters[RecievedOverWire]),
 			humanize.Bytes(totalhistory.counters[SentBytes]+totalhistory.counters[RecievedBytes]),
 			humanize.Bytes(totalhistory.counters[ReadBytes]+totalhistory.counters[WrittenBytes]),
 			humanize.Bytes(totalhistory.counters[BytesProcessed]),
 			totalhistory.counters[FilesProcessed],
 			totalhistory.counters[DirectoriesProcessed])
+		logger.Warn().Msgf("Deleted %v", totalhistory.counters[EntriesDeleted])
 
 	default:
 		logger.Fatal().Msgf("Invalid mode: %v", pflag.Arg(0))

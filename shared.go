@@ -52,6 +52,7 @@ const (
 	BytesProcessed
 	FilesProcessed
 	DirectoriesProcessed
+	EntriesDeleted
 	FileQueue
 	FolderQueue
 	maxperformancecountertype

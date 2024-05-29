@@ -4,7 +4,7 @@
 
 I made this because a customer asked me to transfer 100TB from one system to another. The data were raw backups with billions of files that were hardlinked together. Using rsync it seemed to progress very slowly and not load the RAID system enough - and it would always end badly with the machine running out of memory
 
-#### ALPHA LEVEL CODE - DO NOT USE IN PRODUCTION - VERIFY YOUR DATA AFTER USING
+### VERIFY YOUR DATA AFTER USING
 
 *this is just something I whisked together, so handle with care*
 
@@ -31,7 +31,7 @@ fastsync [--directory /your/source/directory] [--bind 0.0.0.0:7331] server
 Connects to the server and starts syncing files to the client
 
 ```bash
-fastsync [--hardlinks true] [--checksum false] [--pfile 4096] [--pdir 512] [--loglevel info] [--blocksize 131072] [--statsinterval 5] [--queueinterval 30] [--directory /your/target/directory] [--bind serverip:7331] client
+fastsync [--hardlinks true] [--checksum false] [--delete false] [--acl true] [--pfile 4096] [--pdir 512] [--loglevel info] [--blocksize 131072] [--statsinterval 5] [--queueinterval 30] [--directory /your/target/directory] [--bind serverip:7331] client
 ```
 
 Options:
@@ -50,8 +50,3 @@ Options:
 - ```statsinterval``` is how often to output performance data, set to 0 to disable
 
 - ```queueinterval``` is how often to output internal queue data, set to 0 to disable (mostly for debugging)
-
-Current limitations:
-
-- does not delete files on target that do not exist on the source
-- does not work on Windows, as there is a lot of Posix specific code regarding inodes, owner etc.
