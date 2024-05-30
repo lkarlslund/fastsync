@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/lkarlslund/gonk"
@@ -14,8 +15,8 @@ type filehandleindex struct {
 	fh   *os.File
 }
 
-func (fhi filehandleindex) LessThan(fhi2 filehandleindex) bool {
-	return fhi.name < fhi2.name
+func (fhi filehandleindex) Compare(fhi2 filehandleindex) int {
+	return strings.Compare(fhi.name, fhi2.name)
 }
 
 type Server struct {
