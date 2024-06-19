@@ -18,7 +18,8 @@ function BuildVariants {
       if ($currentos -eq "windows") {
         $outputfile += ".exe"
       }
-      CGO_ENABLED=0 go build -ldflags "$ldflags" -o $outputfile $compileflags $path
+      $env:CGO_ENABLED = 0
+      go build -ldflags "$ldflags" -o $outputfile $compileflags $path
       if (Get-Command "cyclonedx-gomod" -ErrorAction SilentlyContinue)
       {
         cyclonedx-gomod app -json -licenses -output $outputfile.bom.json -main $path .
