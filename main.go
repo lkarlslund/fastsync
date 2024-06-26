@@ -43,6 +43,7 @@ func main() {
 	cpuprofilelength := pflag.Int("cpuprofilelength", 0, "Stop profiling after N seconds, 0 to profile until program terminates")
 	transferstatsinterval := pflag.Int("statsinterval", 5, "Show transfer stats every N seconds, 0 to disable")
 	queuestatsinterval := pflag.Int("queueinterval", 30, "Show internal queue sizes every N seconds, 0 to disable")
+	ramlimit := pflag.Int("ramlmit", 1*1024*1024*1024, "Abort if process uses more than this amount bytes of RAM")
 
 	pflag.Parse()
 
@@ -257,6 +258,20 @@ func main() {
 					inodecache, directorycache, files, stack := c.Stats()
 					logger.Warn().Msgf("Inode cache %v, directory cache %v, file queue %v, directory queue %v",
 						inodecache, directorycache, files, stack)
+
+					if *ramlimit > 0 {
+						runtime.GC()
+						var m runtime.MemStats
+						runtime.ReadMemStats(&m)
+						if m.Alloc > *ramlimit {
+							// Using more than 4GB, wooot
+							// Write debug memory info to file
+							mp, _ := os.Create("/tmp/memprofile.pprof")
+							pprof.WriteHeapProfile(mp)
+							mp.Close()
+							logger.Fatal().Msgf("Aborting due to absurd RAM consumption")
+						}
+					}
 				}
 			}()
 		}
