@@ -239,10 +239,10 @@ func main() {
 					time.Sleep(time.Duration(*transferstatsinterval) * time.Second)
 					lasthistory := p.NextHistory()
 					totalhistory = totalhistory.Add(lasthistory)
-					logger.Warn().Msgf("Wired %v/sec, transferred %v/sec, local read/write %v/sec processed %v/sec - %v files/sec - %v dirs/sec",
+					logger.Warn().Msgf("Wired %v/sec, transferred %v/sec, local read %v/sec, local write %v/sec, processed %v/sec, %v files/sec, %v dirs/sec",
 						humanize.Bytes((lasthistory.counters[SentOverWire]+lasthistory.counters[RecievedOverWire])/uint64(*transferstatsinterval)),
 						humanize.Bytes((lasthistory.counters[SentBytes]+lasthistory.counters[RecievedBytes])/uint64(*transferstatsinterval)),
-						humanize.Bytes((lasthistory.counters[ReadBytes]+lasthistory.counters[WrittenBytes])/uint64(*transferstatsinterval)),
+						humanize.Bytes(lasthistory.counters[ReadBytes]/uint64(*transferstatsinterval)), humanize.Bytes((lasthistory.counters[WrittenBytes])/uint64(*transferstatsinterval)),
 						humanize.Bytes((lasthistory.counters[BytesProcessed])/uint64(*transferstatsinterval)),
 						(lasthistory.counters[FilesProcessed])/uint64(*transferstatsinterval),
 						(lasthistory.counters[DirectoriesProcessed])/uint64(*transferstatsinterval))
