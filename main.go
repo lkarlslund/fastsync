@@ -43,7 +43,7 @@ func main() {
 	cpuprofilelength := pflag.Int("cpuprofilelength", 0, "Stop profiling after N seconds, 0 to profile until program terminates")
 	transferstatsinterval := pflag.Int("statsinterval", 5, "Show transfer stats every N seconds, 0 to disable")
 	queuestatsinterval := pflag.Int("queueinterval", 30, "Show internal queue sizes every N seconds, 0 to disable")
-	ramlimit := pflag.Int("ramlmit", 1*1024*1024*1024, "Abort if process uses more than this amount bytes of RAM")
+	ramlimit := pflag.Uint64("ramlmit", 1*1024*1024*1024, "Abort if process uses more than this amount bytes of RAM")
 
 	pflag.Parse()
 
