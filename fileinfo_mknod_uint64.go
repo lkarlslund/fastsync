@@ -1,7 +1,7 @@
 //go:build freebsd
 // +build freebsd
 
-package main
+package fastsync
 
 import "syscall"
 

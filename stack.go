@@ -1,4 +1,4 @@
-package main
+package fastsync
 
 import "sync"
 
@@ -82,7 +82,7 @@ func NewStack[T any](inbuffer, outbuffer int) (*stack[T], <-chan T, chan<- T) {
 			s.data = s.data[:len(s.data)-itemsoutput]
 			if len(s.data) > 16 /* minimum size */ && len(s.data)*4 < cap(s.data) {
 				// shrink it to len
-				logger.Trace().Msgf("Shrinking stack from %v to %v", cap(s.data), len(s.data))
+				Logger.Trace().Msgf("Shrinking stack from %v to %v", cap(s.data), len(s.data))
 				newdata := make([]T, len(s.data))
 				copy(newdata, s.data)
 				s.data = newdata

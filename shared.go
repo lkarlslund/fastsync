@@ -1,4 +1,4 @@
-package main
+package fastsync
 
 import (
 	"io"
@@ -6,6 +6,10 @@ import (
 
 	"github.com/klauspost/compress/s2"
 )
+
+type SharedOptions struct {
+	SendXattr bool
+}
 
 type compressedConn struct {
 	r *s2.Reader
@@ -60,27 +64,31 @@ const (
 
 type AtomicAdder func(uint64)
 
-type performanceentry struct {
+type PerformanceEntry struct {
 	counters [maxperformancecountertype]uint64
 }
 
-func (pe performanceentry) Add(pe2 performanceentry) performanceentry {
-	var result performanceentry
+func (pe PerformanceEntry) Add(pe2 PerformanceEntry) PerformanceEntry {
+	var result PerformanceEntry
 	for i := 0; i < int(maxperformancecountertype); i++ {
 		result.counters[i] = pe.counters[i] + pe2.counters[i]
 	}
 	return result
 }
 
+func (pe PerformanceEntry) Get(pc PerformanceCounterType) uint64 {
+	return pe.counters[pc]
+}
+
 type performance struct {
-	current    atomic.Pointer[performanceentry]
+	current    atomic.Pointer[PerformanceEntry]
 	maxhistory int
-	entries    []performanceentry
+	entries    []PerformanceEntry
 }
 
 func NewPerformance() *performance {
 	p := performance{}
-	p.current.Store(&performanceentry{})
+	p.current.Store(&PerformanceEntry{})
 	p.maxhistory = 300
 	return &p
 }
@@ -96,8 +104,13 @@ func (p *performance) Add(ct PerformanceCounterType, v uint64) {
 	atomic.AddUint64(&pc.counters[ct], v)
 }
 
-func (p *performance) NextHistory() performanceentry {
-	newhistory := performanceentry{}
+func (p *performance) Get(ct PerformanceCounterType) uint64 {
+	pc := p.current.Load()
+	return atomic.LoadUint64(&pc.counters[ct])
+}
+
+func (p *performance) NextHistory() PerformanceEntry {
+	newhistory := PerformanceEntry{}
 	oldhistory := p.current.Swap(&newhistory)
 	if len(p.entries) > p.maxhistory {
 		copy(p.entries, p.entries[1:])
@@ -107,8 +120,6 @@ func (p *performance) NextHistory() performanceentry {
 	}
 	return *oldhistory
 }
-
-var p = NewPerformance()
 
 type PerformanceWrapperReadWriteCloser struct {
 	onWrite, onRead AtomicAdder

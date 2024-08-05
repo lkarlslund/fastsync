@@ -1,7 +1,7 @@
 //go:build darwin || freebsd
 // +build darwin freebsd
 
-package main
+package fastsync
 
 import "syscall"
 

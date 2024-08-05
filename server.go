@@ -1,4 +1,4 @@
-package main
+package fastsync
 
 import (
 	"errors"
@@ -10,6 +10,9 @@ import (
 	"github.com/lkarlslund/gonk"
 )
 
+var ErrPleaseSayHello = errors.New("Client needs to say hello")
+var ErrPleaseSayHelloOnce = errors.New("Client needs to say hello just once")
+
 type filehandleindex struct {
 	name string
 	fh   *os.File
@@ -19,21 +22,43 @@ func (fhi filehandleindex) Compare(fhi2 filehandleindex) int {
 	return strings.Compare(fhi.name, fhi2.name)
 }
 
-type Server struct {
-	BasePath string
-	ReadOnly bool
-
-	shutdown chan struct{}
-	files    gonk.Gonk[filehandleindex]
+func NewServer() *Server {
+	return &Server{
+		BasePath: ".",
+		ReadOnly: true,
+		shutdown: make(chan struct{}),
+		Perf:     NewPerformance(),
+	}
 }
 
-type FileListResponse struct {
-	ParentDirectory string
-	Files           []FileInfo
+type Server struct {
+	BasePath string
+
+	Options SharedOptions
+
+	ReadOnly bool
+
+	clientsaidhello bool
+	shutdown        chan struct{}
+	files           gonk.Gonk[filehandleindex]
+
+	Perf *performance
+}
+
+func (s *Server) Hello(options SharedOptions, reply *any) error {
+	//	if s.clientsaidhello {
+	//		return ErrPleaseSayHelloOnce
+	//	}
+	s.Options = options
+	s.clientsaidhello = true
+	return nil
 }
 
 func (s *Server) Shutdown(input any, reply *any) error {
-	logger.Info().Msg("Shutting down server")
+	if !s.clientsaidhello {
+		return ErrPleaseSayHello
+	}
+	Logger.Info().Msg("Shutting down server")
 	if len(s.shutdown) == 0 {
 		s.shutdown <- struct{}{}
 	}
@@ -41,7 +66,10 @@ func (s *Server) Shutdown(input any, reply *any) error {
 }
 
 func (s *Server) List(path string, reply *FileListResponse) error {
-	logger.Trace().Msgf("Listing files in %s", path)
+	if !s.clientsaidhello {
+		return ErrPleaseSayHello
+	}
+	Logger.Trace().Msgf("Listing files in %s", path)
 
 	var flr FileListResponse
 	flr.ParentDirectory = path
@@ -63,6 +91,9 @@ func (s *Server) List(path string, reply *FileListResponse) error {
 		}
 		// Override path to only send the relative path
 		fi.Name = relativepath
+		if !s.Options.SendXattr {
+			fi.Xattrs = nil
+		}
 		flr.Files = append(flr.Files, fi)
 	}
 	*reply = flr
@@ -70,7 +101,10 @@ func (s *Server) List(path string, reply *FileListResponse) error {
 }
 
 func (s *Server) Stat(path string, reply *FileInfo) error {
-	logger.Trace().Msgf("Stat entry %s", path)
+	if !s.clientsaidhello {
+		return ErrPleaseSayHello
+	}
+	Logger.Trace().Msgf("Stat entry %s", path)
 
 	absolutepath := filepath.Join(s.BasePath, path)
 	relativepath := path
@@ -86,14 +120,11 @@ func (s *Server) Stat(path string, reply *FileInfo) error {
 	return err
 }
 
-type GetChunkArgs struct {
-	Path   string
-	Offset uint64
-	Size   uint64
-}
-
 func (s *Server) Open(path string, reply *interface{}) error {
-	logger.Trace().Msgf("Opening file %s", path)
+	if !s.clientsaidhello {
+		return ErrPleaseSayHello
+	}
+	Logger.Trace().Msgf("Opening file %s", path)
 	h, err := os.Open(filepath.Join(s.BasePath, path))
 	if err != nil {
 		return err
@@ -108,7 +139,10 @@ func (s *Server) Open(path string, reply *interface{}) error {
 }
 
 func (s *Server) GetChunk(args GetChunkArgs, data *[]byte) error {
-	logger.Trace().Msgf("Getting chunk from file %s at offset %d size %d", args.Path, args.Offset, args.Size)
+	if !s.clientsaidhello {
+		return ErrPleaseSayHello
+	}
+	Logger.Trace().Msgf("Getting chunk from file %s at offset %d size %d", args.Path, args.Offset, args.Size)
 	fi, found := s.files.Load(filehandleindex{
 		name: args.Path,
 	})
@@ -128,7 +162,10 @@ func (s *Server) GetChunk(args GetChunkArgs, data *[]byte) error {
 }
 
 func (s *Server) ChecksumChunk(args GetChunkArgs, checksum *uint64) error {
-	logger.Trace().Msgf("Checksumming chunk from file %s at offset %d size %d", args.Path, args.Offset, args.Size)
+	if !s.clientsaidhello {
+		return ErrPleaseSayHello
+	}
+	Logger.Trace().Msgf("Checksumming chunk from file %s at offset %d size %d", args.Path, args.Offset, args.Size)
 	fi, found := s.files.Load(filehandleindex{
 		name: args.Path,
 	})
@@ -149,7 +186,10 @@ func (s *Server) ChecksumChunk(args GetChunkArgs, checksum *uint64) error {
 }
 
 func (s *Server) Close(path string, reply *interface{}) error {
-	logger.Trace().Msgf("Closing file %s", path)
+	if !s.clientsaidhello {
+		return ErrPleaseSayHello
+	}
+	Logger.Trace().Msgf("Closing file %s", path)
 	fi, found := s.files.Load(filehandleindex{
 		name: path,
 	})

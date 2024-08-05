@@ -1,7 +1,7 @@
 //go:build !darwin && !freebsd && !windows
 // +build !darwin,!freebsd,!windows
 
-package main
+package fastsync
 
 import "syscall"
 
