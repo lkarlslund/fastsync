@@ -76,7 +76,9 @@ func NewClient() *Client {
 		ParallelDir:       512,
 		PreserveHardlinks: true,
 		BlockSize:         16 * 1024,
-
+		Options: SharedOptions{
+			ProtocolVersion: PROTOCOLVERSION,
+		},
 		Perf: NewPerformance(),
 	}
 

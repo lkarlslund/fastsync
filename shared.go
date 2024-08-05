@@ -7,8 +7,11 @@ import (
 	"github.com/klauspost/compress/s2"
 )
 
+const PROTOCOLVERSION = 1
+
 type SharedOptions struct {
-	SendXattr bool
+	ProtocolVersion int
+	SendXattr       bool
 }
 
 type compressedConn struct {

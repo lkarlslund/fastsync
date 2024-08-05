@@ -2,6 +2,7 @@ package fastsync
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,6 +50,9 @@ func (s *Server) Hello(options SharedOptions, reply *any) error {
 	//	if s.clientsaidhello {
 	//		return ErrPleaseSayHelloOnce
 	//	}
+	if options.ProtocolVersion != PROTOCOLVERSION {
+		return fmt.Errorf("Server expects protocol version %v, but client is running %v, please use same binary version for transfers", PROTOCOLVERSION, options.ProtocolVersion)
+	}
 	s.Options = options
 	s.clientsaidhello = true
 	return nil
