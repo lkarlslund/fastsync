@@ -2,6 +2,9 @@
 
 ## Fast syncronization across networks using speedy compression, lots of parallelization and fast hashmaps for keeping track of things internally
 
+
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/lkarlslund/fastsync)](https://github.com/lkarlslund/fastsync/releases/latest) ![GitHub all releases](https://img.shields.io/github/downloads/lkarlslund/fastsync/total) ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/lkarlslund/fastsync/prerelease.yml?branch=main)
+
 I made this because a customer asked me to transfer 100TB from one system to another. The data were raw backups with billions of files that were hardlinked together. Using rsync it seemed to progress very slowly and not load the RAID system enough - and it would always end badly with the machine running out of memory
 
 ### VERIFY YOUR DATA AFTER USING
