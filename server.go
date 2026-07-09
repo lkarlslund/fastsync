@@ -7,29 +7,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/cespare/xxhash/v2"
-	"github.com/lkarlslund/gonk"
 )
 
 var ErrPleaseSayHello = errors.New("Client needs to say hello")
 var ErrPleaseSayHelloOnce = errors.New("Client needs to say hello just once")
 var ErrInvalidPath = errors.New("invalid path")
 
-type filehandleindex struct {
-	name string
-	fh   *os.File
-}
-
-func (fhi filehandleindex) Compare(fhi2 filehandleindex) int {
-	return strings.Compare(fhi.name, fhi2.name)
-}
-
 func NewServer() *Server {
 	return &Server{
 		BasePath: ".",
 		ReadOnly: true,
 		shutdown: make(chan struct{}, 1),
+		files:    make(map[string]*os.File),
 		Perf:     NewPerformance(),
 	}
 }
@@ -43,7 +35,8 @@ type Server struct {
 
 	clientsaidhello bool
 	shutdown        chan struct{}
-	files           gonk.Gonk[filehandleindex]
+	filesMu         sync.Mutex
+	files           map[string]*os.File
 
 	Perf *performance
 }
@@ -162,12 +155,16 @@ func (s *Server) Open(path string, reply *interface{}) error {
 	if err != nil {
 		return err
 	}
-	s.files.Store(
-		filehandleindex{
-			name: path,
-			fh:   h,
-		},
-	)
+	s.filesMu.Lock()
+	if s.files == nil {
+		s.files = make(map[string]*os.File)
+	}
+	old := s.files[path]
+	s.files[path] = h
+	s.filesMu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
 	return nil
 }
 
@@ -176,9 +173,9 @@ func (s *Server) GetChunk(args GetChunkArgs, data *[]byte) error {
 		return ErrPleaseSayHello
 	}
 	Logger.Trace().Msgf("Getting chunk from file %s at offset %d size %d", args.Path, args.Offset, args.Size)
-	fi, found := s.files.Load(filehandleindex{
-		name: args.Path,
-	})
+	s.filesMu.Lock()
+	fh, found := s.files[args.Path]
+	s.filesMu.Unlock()
 	if !found {
 		return errors.New("file handle not found")
 	}
@@ -186,7 +183,7 @@ func (s *Server) GetChunk(args GetChunkArgs, data *[]byte) error {
 		return fmt.Errorf("chunk size too large: %d", args.Size)
 	}
 	d := make([]byte, int(args.Size))
-	n, err := fi.fh.ReadAt(d, int64(args.Offset))
+	n, err := fh.ReadAt(d, int64(args.Offset))
 	if err != nil {
 		return err
 	}
@@ -202,9 +199,9 @@ func (s *Server) ChecksumChunk(args GetChunkArgs, checksum *uint64) error {
 		return ErrPleaseSayHello
 	}
 	Logger.Trace().Msgf("Checksumming chunk from file %s at offset %d size %d", args.Path, args.Offset, args.Size)
-	fi, found := s.files.Load(filehandleindex{
-		name: args.Path,
-	})
+	s.filesMu.Lock()
+	fh, found := s.files[args.Path]
+	s.filesMu.Unlock()
 	if !found {
 		return errors.New("file handle not found")
 	}
@@ -212,7 +209,7 @@ func (s *Server) ChecksumChunk(args GetChunkArgs, checksum *uint64) error {
 		return fmt.Errorf("chunk size too large: %d", args.Size)
 	}
 	data := make([]byte, int(args.Size))
-	n, err := fi.fh.ReadAt(data, int64(args.Offset))
+	n, err := fh.ReadAt(data, int64(args.Offset))
 	if err != nil {
 		return err
 	}
@@ -229,14 +226,15 @@ func (s *Server) Close(path string, reply *interface{}) error {
 		return ErrPleaseSayHello
 	}
 	Logger.Trace().Msgf("Closing file %s", path)
-	fi, found := s.files.Load(filehandleindex{
-		name: path,
-	})
+	s.filesMu.Lock()
+	fh, found := s.files[path]
 	if !found {
+		s.filesMu.Unlock()
 		return errors.New("file handle not found")
 	}
-	s.files.Delete(fi)
-	return fi.fh.Close()
+	delete(s.files, path)
+	s.filesMu.Unlock()
+	return fh.Close()
 }
 
 func (s *Server) Wait() {

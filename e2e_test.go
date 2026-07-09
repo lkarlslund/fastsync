@@ -215,3 +215,32 @@ func TestClientServerSyncCopiesSymlink(t *testing.T) {
 		t.Fatalf("symlink target = %q, want %q", got, "target.txt")
 	}
 }
+
+func TestClientServerSyncPreservesHardlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("hardlink metadata differs on Windows")
+	}
+
+	source := t.TempDir()
+	dest := t.TempDir()
+	writeTestFile(t, source, "a.txt", "shared")
+	if err := os.Link(filepath.Join(source, "a.txt"), filepath.Join(source, "b.txt")); err != nil {
+		t.Skipf("hardlinks not supported in this environment: %v", err)
+	}
+
+	runTestSync(t, source, dest, func(client *Client) {
+		client.PreserveHardlinks = true
+	})
+
+	a, err := PathToFileInfo(filepath.Join(dest, "a.txt"))
+	if err != nil {
+		t.Fatalf("stat destination a.txt: %v", err)
+	}
+	b, err := PathToFileInfo(filepath.Join(dest, "b.txt"))
+	if err != nil {
+		t.Fatalf("stat destination b.txt: %v", err)
+	}
+	if a.Dev != b.Dev || a.Inode != b.Inode {
+		t.Fatalf("destination files are not hardlinked: a=%d/%d b=%d/%d", a.Dev, a.Inode, b.Dev, b.Inode)
+	}
+}

@@ -6,7 +6,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dustin/go-humanize v1.0.1
 	github.com/klauspost/compress v1.17.9
-	github.com/lkarlslund/gonk v0.0.0-20240227175124-4dc0aa78e98a
 	github.com/pkg/xattr v0.4.10
 	github.com/rs/zerolog v1.33.0
 	github.com/spf13/pflag v1.0.9 // indirect
@@ -17,6 +16,7 @@ require (
 require (
 	github.com/NimbleMarkets/ntcharts v0.3.1
 	github.com/charmbracelet/lipgloss v1.1.0
+	golang.org/x/term v0.35.0
 )
 
 require (
@@ -39,7 +39,6 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/sync v0.9.0 // indirect
-	golang.org/x/term v0.35.0 // indirect
 	golang.org/x/text v0.20.0 // indirect
 )
 
