@@ -58,9 +58,11 @@ type Client struct {
 	dirWorkerWG, fileWorkerWG sync.WaitGroup
 
 	filequeue chan FileInfo
+	inodesMu  sync.Mutex
 	inodes    gonk.Gonk[inodeinfo]
 
-	dircache gonk.Gonk[dirinfo]
+	dircacheMu sync.Mutex
+	dircache   gonk.Gonk[dirinfo]
 
 	dirstack    *stack[FileInfo]
 	dirqueuein  chan<- FileInfo
@@ -106,10 +108,13 @@ func (c *Client) Run(client *rpc.Client) error {
 	}
 	Logger.Debug().Msg("Queueing directory / from remote")
 	listfilesActive.Add(1)
+	c.dircacheMu.Lock()
 	c.dircache.Store(dirinfo{
 		name:      rootdirinfo.Name,
+		info:      rootdirinfo,
 		remaining: -1,
 	})
+	c.dircacheMu.Unlock()
 	c.dirqueuein <- rootdirinfo
 
 	// Launch directory workers
@@ -157,6 +162,7 @@ func (c *Client) Run(client *rpc.Client) error {
 				Logger.Trace().Msgf("Directory %v has %v remote entries (%v to delete local)", item.Name, len(filelistresponse.Files), len(extraentries))
 
 				var directoryfound bool
+				c.dircacheMu.Lock()
 				c.dircache.AtomicMutate(dirinfo{
 					name: item.Name,
 				}, func(f *dirinfo) {
@@ -164,6 +170,7 @@ func (c *Client) Run(client *rpc.Client) error {
 					f.extraentries = extraentries
 					directoryfound = true
 				}, false)
+				c.dircacheMu.Unlock()
 				if !directoryfound {
 					Logger.Error().Msgf("directory %v not found in directory cache", filelistresponse.ParentDirectory)
 				}
@@ -214,11 +221,13 @@ func (c *Client) Run(client *rpc.Client) error {
 							}
 							Logger.Trace().Msgf("Queueing directory %v", remotefi.Name)
 							listfilesActive.Add(1)
+							c.dircacheMu.Lock()
 							c.dircache.Store(dirinfo{
 								name:      remotefi.Name,
 								info:      remotefi,
 								remaining: -1, // we don't know yet
 							})
+							c.dircacheMu.Unlock()
 							c.dirqueuein <- remotefi
 						}
 					}
@@ -269,6 +278,7 @@ func (c *Client) Run(client *rpc.Client) error {
 				var justaddedtoinodecache bool
 				if c.PreserveHardlinks && remotefi.Nlink > 1 {
 					Logger.Trace().Msgf("Saving/updating remote dev/inode number %v/%v to cache for file %s with %d hardlinks", remotefi.Dev, remotefi.Inode, remotefi.Name, remotefi.Nlink)
+					c.inodesMu.Lock()
 					c.inodes.AtomicMutate(inodeinfo{
 						dev:               remotefi.Dev,
 						inode:             remotefi.Inode,
@@ -285,14 +295,17 @@ func (c *Client) Run(client *rpc.Client) error {
 							atomic.SwapUint64(&i.localdev, localfi.Dev)
 						}
 					}, true)
+					c.inodesMu.Unlock()
 				}
 
 				// if it's a hardlinked file, check that it's linked correctly
 				if !create_file && remotefi.Nlink > 1 && c.PreserveHardlinks && !justaddedtoinodecache {
+					c.inodesMu.Lock()
 					if ini, found := c.inodes.Load(inodeinfo{
 						dev:   remotefi.Dev,
 						inode: remotefi.Inode,
 					}); found {
+						c.inodesMu.Unlock()
 						if ini.localinode == 0 {
 							// Find the local inode, we only need to do this once
 							for {
@@ -304,6 +317,7 @@ func (c *Client) Run(client *rpc.Client) error {
 									Logger.Error().Msgf("Error getting hardlink stat for local path %s: %v", ini.localhardlinkpath, err)
 									continue
 								} else {
+									c.inodesMu.Lock()
 									c.inodes.AtomicMutate(inodeinfo{
 										dev:   remotefi.Dev,
 										inode: remotefi.Inode,
@@ -313,6 +327,7 @@ func (c *Client) Run(client *rpc.Client) error {
 											ini = *i
 										}
 									}, false)
+									c.inodesMu.Unlock()
 									break
 								}
 							}
@@ -327,6 +342,8 @@ func (c *Client) Run(client *rpc.Client) error {
 							}
 							create_file = true
 						}
+					} else {
+						c.inodesMu.Unlock()
 					}
 				}
 
@@ -374,10 +391,12 @@ func (c *Client) Run(client *rpc.Client) error {
 
 				// try to hard link it
 				if create_file && c.PreserveHardlinks && remotefi.Nlink > 1 && !justaddedtoinodecache {
+					c.inodesMu.Lock()
 					if ini, found := c.inodes.Load(inodeinfo{
 						dev:   remotefi.Dev,
 						inode: remotefi.Inode,
 					}); found {
+						c.inodesMu.Unlock()
 						if localpath != ini.localhardlinkpath {
 							Logger.Debug().Msgf("Hardlinking %s to %s", localpath, ini.localhardlinkpath)
 							var retries int
@@ -404,6 +423,7 @@ func (c *Client) Run(client *rpc.Client) error {
 							apply_attributes = true
 						}
 					} else {
+						c.inodesMu.Unlock()
 						Logger.Error().Msgf("Remote file %s indicates it should be hardlinked with %v others, but we don't have a match locally", remotefi.Name, remotefi.Nlink)
 					}
 				}
@@ -546,10 +566,12 @@ func (c *Client) Run(client *rpc.Client) error {
 				if remaininghardlinks == 0 {
 					// No more references, free up some memory
 					Logger.Trace().Msgf("No more references to this inode, removing it from inode cache")
+					c.inodesMu.Lock()
 					c.inodes.Delete(inodeinfo{
 						dev:   remotefi.Dev,
 						inode: remotefi.Inode,
 					})
+					c.inodesMu.Unlock()
 				}
 
 				// are we done with this directory, the apply attributes to that
@@ -585,6 +607,7 @@ func (c *Client) ProcessedItemInDir(path string) {
 	}
 	donewithdirectory := false
 	founddirectory := false
+	c.dircacheMu.Lock()
 	c.dircache.AtomicMutate(lookupdirectory, func(item *dirinfo) {
 		founddirectory = true
 		left := atomic.AddInt32(&item.remaining, -1)
@@ -594,11 +617,14 @@ func (c *Client) ProcessedItemInDir(path string) {
 			donewithdirectory = true // delete operation must be outside this atomic operation
 		}
 	}, false)
+	c.dircacheMu.Unlock()
 	if !founddirectory {
 		Logger.Error().Msgf("Failed to find directory info for postprocessing %s", lookupdirectory.name)
 	}
 	if donewithdirectory {
+		c.dircacheMu.Lock()
 		c.dircache.Delete(lookupdirectory)
+		c.dircacheMu.Unlock()
 		if path != "/" {
 			c.ProcessedItemInDir(filepath.Dir(path))
 		}
@@ -636,10 +662,15 @@ func (c *Client) Done() bool {
 }
 
 func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
-	return c.inodes.Len(),
-		c.dircache.Len(),
-		len(c.filequeue),
-		c.dirstack.Len()
+	c.inodesMu.Lock()
+	inodes = c.inodes.Len()
+	c.inodesMu.Unlock()
+
+	c.dircacheMu.Lock()
+	directories = c.dircache.Len()
+	c.dircacheMu.Unlock()
+
+	return inodes, directories, len(c.filequeue), c.dirstack.Len()
 }
 
 func (c *Client) Wait() {

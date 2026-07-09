@@ -88,7 +88,7 @@ func (fi FileInfo) ApplyChanges(fi2 FileInfo) error {
 	}
 
 	if fi2.Mode&fs.ModeSymlink == 0 {
-		if uint32(fi.Mode)&^uint32(os.ModePerm) != fi2.Permissions&^uint32(os.ModePerm) {
+		if fi.Mode.Perm() != fi2.Mode.Perm() {
 			err := fi.Chmod(fi2)
 			if err != nil {
 				Logger.Error().Msgf("Error changing mode for %s: %v", fi.Name, err)

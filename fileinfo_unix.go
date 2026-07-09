@@ -42,7 +42,7 @@ func (fi FileInfo) SetTimestamps(fi2 FileInfo) error {
 }
 
 func (fi FileInfo) Chmod(fi2 FileInfo) error {
-	return unix.Chmod(fi.Name, fi2.Permissions)
+	return unix.Chmod(fi.Name, fi2.Permissions&uint32(os.ModePerm))
 	// return unix.Fchmodat(unix.AT_FDCWD, f.Name, fi2.Permissions, unix.AT_SYMLINK_NOFOLLOW)
 }
 
