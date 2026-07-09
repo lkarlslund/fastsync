@@ -24,7 +24,9 @@ func (f FileInfo) Create(remotefi FileInfo) error {
 	}
 	// regular file
 	file, err := os.Create(f.Name)
-	file.Close()
+	if err == nil {
+		err = file.Close()
+	}
 	return err
 }
 
@@ -63,6 +65,7 @@ func (f *FileInfo) extractNativeInfo(fsfi fs.FileInfo) error {
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 	err = syscall.GetFileInformationByHandle(syscall.Handle(file.Fd()), &d)
 	if err != nil {
 		return err

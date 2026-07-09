@@ -41,9 +41,13 @@ func (c *compressedConn) Write(p []byte) (n int, err error) {
 }
 
 func (c *compressedConn) Close() (err error) {
-	c.w.Close()
-	err = c.c.Close()
-	return
+	if closeErr := c.w.Close(); closeErr != nil {
+		err = closeErr
+	}
+	if closeErr := c.c.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	return err
 }
 
 // performance related stuff
@@ -115,7 +119,7 @@ func (p *performance) Get(ct PerformanceCounterType) uint64 {
 func (p *performance) NextHistory() PerformanceEntry {
 	newhistory := PerformanceEntry{}
 	oldhistory := p.current.Swap(&newhistory)
-	if len(p.entries) > p.maxhistory {
+	if len(p.entries) >= p.maxhistory {
 		copy(p.entries, p.entries[1:])
 		p.entries[len(p.entries)-1] = *oldhistory
 	} else {

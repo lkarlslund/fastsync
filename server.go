@@ -3,6 +3,7 @@ package fastsync
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 var ErrPleaseSayHello = errors.New("Client needs to say hello")
 var ErrPleaseSayHelloOnce = errors.New("Client needs to say hello just once")
+var ErrInvalidPath = errors.New("invalid path")
 
 type filehandleindex struct {
 	name string
@@ -27,7 +29,7 @@ func NewServer() *Server {
 	return &Server{
 		BasePath: ".",
 		ReadOnly: true,
-		shutdown: make(chan struct{}),
+		shutdown: make(chan struct{}, 1),
 		Perf:     NewPerformance(),
 	}
 }
@@ -44,6 +46,21 @@ type Server struct {
 	files           gonk.Gonk[filehandleindex]
 
 	Perf *performance
+}
+
+func (s *Server) localPath(path string) (string, error) {
+	rel := filepath.Clean(path)
+	if rel == "." || rel == string(filepath.Separator) {
+		return s.BasePath, nil
+	}
+	rel = strings.TrimLeft(rel, `/\`)
+	if rel == "" {
+		return s.BasePath, nil
+	}
+	if filepath.VolumeName(rel) != "" || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidPath, path)
+	}
+	return filepath.Join(s.BasePath, rel), nil
 }
 
 func (s *Server) Hello(options SharedOptions, reply *any) error {
@@ -63,8 +80,9 @@ func (s *Server) Shutdown(input any, reply *any) error {
 		return ErrPleaseSayHello
 	}
 	Logger.Info().Msg("Shutting down server")
-	if len(s.shutdown) == 0 {
-		s.shutdown <- struct{}{}
+	select {
+	case s.shutdown <- struct{}{}:
+	default:
 	}
 	return nil
 }
@@ -78,12 +96,16 @@ func (s *Server) List(path string, reply *FileListResponse) error {
 	var flr FileListResponse
 	flr.ParentDirectory = path
 
-	entries, err := os.ReadDir(filepath.Join(s.BasePath, path))
+	localpath, err := s.localPath(path)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(localpath)
 	if err != nil {
 		return err
 	}
 	for _, d := range entries {
-		absolutepath := filepath.Join(s.BasePath, path, d.Name())
+		absolutepath := filepath.Join(localpath, d.Name())
 		relativepath := filepath.Join(path, d.Name())
 		info, err := d.Info()
 		if err != nil {
@@ -110,7 +132,10 @@ func (s *Server) Stat(path string, reply *FileInfo) error {
 	}
 	Logger.Trace().Msgf("Stat entry %s", path)
 
-	absolutepath := filepath.Join(s.BasePath, path)
+	absolutepath, err := s.localPath(path)
+	if err != nil {
+		return err
+	}
 	relativepath := path
 
 	info, err := os.Lstat(absolutepath)
@@ -129,7 +154,11 @@ func (s *Server) Open(path string, reply *interface{}) error {
 		return ErrPleaseSayHello
 	}
 	Logger.Trace().Msgf("Opening file %s", path)
-	h, err := os.Open(filepath.Join(s.BasePath, path))
+	localpath, err := s.localPath(path)
+	if err != nil {
+		return err
+	}
+	h, err := os.Open(localpath)
 	if err != nil {
 		return err
 	}
@@ -153,13 +182,16 @@ func (s *Server) GetChunk(args GetChunkArgs, data *[]byte) error {
 	if !found {
 		return errors.New("file handle not found")
 	}
-	d := make([]byte, args.Size)
+	if args.Size > uint64(int(^uint(0)>>1)) {
+		return fmt.Errorf("chunk size too large: %d", args.Size)
+	}
+	d := make([]byte, int(args.Size))
 	n, err := fi.fh.ReadAt(d, int64(args.Offset))
 	if err != nil {
 		return err
 	}
 	if n != int(args.Size) {
-		return errors.New("end of file reached")
+		return io.ErrUnexpectedEOF
 	}
 	*data = d
 	return nil
@@ -176,13 +208,16 @@ func (s *Server) ChecksumChunk(args GetChunkArgs, checksum *uint64) error {
 	if !found {
 		return errors.New("file handle not found")
 	}
-	data := make([]byte, args.Size)
+	if args.Size > uint64(int(^uint(0)>>1)) {
+		return fmt.Errorf("chunk size too large: %d", args.Size)
+	}
+	data := make([]byte, int(args.Size))
 	n, err := fi.fh.ReadAt(data, int64(args.Offset))
 	if err != nil {
 		return err
 	}
 	if n != int(args.Size) {
-		return errors.New("end of file reached")
+		return io.ErrUnexpectedEOF
 	}
 	cs := xxhash.Sum64(data)
 	*checksum = cs
@@ -201,8 +236,7 @@ func (s *Server) Close(path string, reply *interface{}) error {
 		return errors.New("file handle not found")
 	}
 	s.files.Delete(fi)
-	fi.fh.Close()
-	return nil
+	return fi.fh.Close()
 }
 
 func (s *Server) Wait() {

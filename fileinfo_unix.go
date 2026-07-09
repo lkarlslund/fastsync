@@ -28,7 +28,7 @@ func (fi FileInfo) Create(fi2 FileInfo) error {
 	}
 	file, err := os.Create(fi.Name)
 	if err == nil {
-		file.Close()
+		err = file.Close()
 	}
 	return err
 }

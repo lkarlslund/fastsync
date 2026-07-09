@@ -67,7 +67,9 @@ func main() {
 					go func() {
 						time.Sleep(time.Duration(cpuprofilelength) * time.Second)
 						pprof.StopCPUProfile()
-						f.Close()
+						if err := f.Close(); err != nil {
+							fastsync.Logger.Error().Msgf("Error closing CPU profile: %v", err)
+						}
 						fastsync.Logger.Warn().Msgf("CPU profiling stopped")
 					}()
 				} else {
@@ -115,11 +117,11 @@ func main() {
 			go func() {
 				for {
 					conn, err := listener.Accept()
-					fastsync.Logger.Info().Msgf("Accepted connection from %v", conn.RemoteAddr())
 					if err != nil {
 						fastsync.Logger.Error().Msgf("Error accepting connection: %v", err)
 						continue
 					}
+					fastsync.Logger.Info().Msgf("Accepted connection from %v", conn.RemoteAddr())
 					wconn := fastsync.NewPerformanceWrapper(conn, fastsyncserver.Perf.GetAtomicAdder(fastsync.RecievedOverWire), fastsyncserver.Perf.GetAtomicAdder(fastsync.SentOverWire))
 					cconn := fastsync.CompressedReadWriteCloser(wconn)
 					wcconn := fastsync.NewPerformanceWrapper(cconn, fastsyncserver.Perf.GetAtomicAdder(fastsync.RecievedBytes), fastsyncserver.Perf.GetAtomicAdder(fastsync.SentBytes))
@@ -170,9 +172,9 @@ func main() {
 
 			conn, err := net.Dial("tcp", serveraddr)
 			if err != nil {
-				fastsync.Logger.Fatal().Msgf("Error connecting to %s: %v", bind, err)
+				fastsync.Logger.Fatal().Msgf("Error connecting to %s: %v", serveraddr, err)
 			}
-			fastsync.Logger.Info().Msgf("Connected to %s", bind)
+			fastsync.Logger.Info().Msgf("Connected to %s", serveraddr)
 
 			wconn := fastsync.NewPerformanceWrapper(conn, c.Perf.GetAtomicAdder(fastsync.RecievedOverWire), c.Perf.GetAtomicAdder(fastsync.SentOverWire))
 			cconn := fastsync.CompressedReadWriteCloser(wconn)
@@ -214,7 +216,9 @@ func main() {
 				fastsync.Logger.Error().Msgf("Error running client: %v", err)
 			}
 
-			rpcClient.Close()
+			if err := rpcClient.Close(); err != nil {
+				fastsync.Logger.Error().Msgf("Error closing RPC client: %v", err)
+			}
 
 			lasthistory := c.Perf.NextHistory()
 			totalhistory = totalhistory.Add(lasthistory)
@@ -254,15 +258,23 @@ func main() {
 
 			conn, err := net.Dial("tcp", serveraddr)
 			if err != nil {
-				fastsync.Logger.Fatal().Msgf("Error connecting to %s: %v", bind, err)
+				fastsync.Logger.Fatal().Msgf("Error connecting to %s: %v", serveraddr, err)
 			}
 			var h codec.MsgpackHandle
-			rpcCodec := codec.GoRpc.ClientCodec(conn, &h)
+			cconn := fastsync.CompressedReadWriteCloser(conn)
+			rpcCodec := codec.GoRpc.ClientCodec(cconn, &h)
 			rpcClient := rpc.NewClientWithCodec(rpcCodec)
+			options := fastsync.SharedOptions{ProtocolVersion: fastsync.PROTOCOLVERSION}
+			if err := rpcClient.Call("Server.Hello", &options, nil); err != nil {
+				fastsync.Logger.Fatal().Msgf("Error saying hello: %v", err)
+			}
 			fastsync.Logger.Info().Msg("Shutting down server")
 			err = rpcClient.Call("Server.Shutdown", nil, nil)
 			if err != nil {
 				fastsync.Logger.Fatal().Msgf("Error shutting down: %v", err)
+			}
+			if err := rpcClient.Close(); err != nil {
+				fastsync.Logger.Error().Msgf("Error closing RPC client: %v", err)
 			}
 			fastsync.Logger.Info().Msg("Server is shut down")
 			os.Exit(0)
@@ -319,7 +331,9 @@ func autoProfile() {
 				time.Sleep(time.Minute)
 				pprof.StopCPUProfile()
 				autoprofiling = false
-				f.Close()
+				if err := f.Close(); err != nil {
+					fastsync.Logger.Error().Msgf("Error closing CPU profile: %v", err)
+				}
 				fastsync.Logger.Warn().Msgf("CPU auto profiling stopped")
 			}()
 		}

@@ -440,14 +440,24 @@ func (c *Client) Run(client *rpc.Client) error {
 						Logger.Error().Msgf("Error opening existing local file %s: %v", localpath, err)
 						continue
 					}
-					fi, _ := os.Stat(localpath)
+					fi, err := localfile.Stat()
+					if err != nil {
+						Logger.Error().Msgf("Error stating existing local file %s: %v", localpath, err)
+						if closeErr := localfile.Close(); closeErr != nil {
+							Logger.Error().Msgf("Error closing local file %s: %v", localpath, closeErr)
+						}
+						continue
+					}
 					existingsize = fi.Size()
 
 					err = client.Call("Server.Open", remotefi.Name, nil)
 					if err != nil {
 						Logger.Error().Msgf("Error opening remote file %s: %v", remotefi.Name, err)
 						Logger.Error().Msgf("Item fileinfo: %+v", remotefi)
-						break
+						if closeErr := localfile.Close(); closeErr != nil {
+							Logger.Error().Msgf("Error closing local file %s: %v", localpath, closeErr)
+						}
+						continue
 					}
 
 					for i := int64(0); i < remotefi.Size; i += int64(c.BlockSize) {
@@ -475,7 +485,7 @@ func (c *Client) Run(client *rpc.Client) error {
 							if cap(localdata) < int(length) {
 								localdata = make([]byte, length)
 							}
-							localdata = localdata[:0]
+							localdata = localdata[:int(length)]
 
 							n, err := localfile.ReadAt(localdata, i)
 							if err != nil {
@@ -519,7 +529,9 @@ func (c *Client) Run(client *rpc.Client) error {
 					if err != nil {
 						Logger.Error().Msgf("Error closing remote file %s: %v", remotefi.Name, err)
 					}
-					localfile.Close()
+					if err := localfile.Close(); err != nil {
+						Logger.Error().Msgf("Error closing local file %s: %v", localpath, err)
+					}
 				}
 
 				if apply_attributes && transfersuccess {
@@ -609,7 +621,9 @@ func (c *Client) PostProcessDir(item *dirinfo) {
 	if err != nil {
 		Logger.Error().Msgf("Problem getting local directory information for %v: %v", filepath.Join(c.BasePath, item.name), err)
 	} else {
-		localdirfi.ApplyChanges(item.info)
+		if err := localdirfi.ApplyChanges(item.info); err != nil {
+			Logger.Error().Msgf("Problem applying directory metadata for %v: %v", filepath.Join(c.BasePath, item.name), err)
+		}
 	}
 }
 

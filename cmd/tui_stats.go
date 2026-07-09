@@ -64,12 +64,12 @@ func showStatsTUI(statsCh <-chan stats) {
 
 	clearAndDraw := func(view string) {
 		// Move cursor to top-left and clear only the chart area
-		os.Stdout.Write([]byte("\033[H"))
+		_, _ = os.Stdout.Write([]byte("\033[H"))
 		for i := 0; i < chartHeight+2; i++ {
-			os.Stdout.Write([]byte("\033[2K\r")) // clear line
+			_, _ = os.Stdout.Write([]byte("\033[2K\r")) // clear line
 		}
-		os.Stdout.Write([]byte("\033[H"))
-		os.Stdout.Write([]byte(view))
+		_, _ = os.Stdout.Write([]byte("\033[H"))
+		_, _ = os.Stdout.Write([]byte(view))
 	}
 
 	for {

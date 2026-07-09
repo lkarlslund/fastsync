@@ -1,12 +1,15 @@
 package fastsync
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 type stack[T any] struct {
 	outchan chan T
 	inchan  chan T
 	data    []T
-	closed  bool
+	closed  atomic.Bool
 	lock    sync.Mutex
 	block   sync.WaitGroup
 }
@@ -53,7 +56,7 @@ func NewStack[T any](inbuffer, outbuffer int) (*stack[T], <-chan T, chan<- T) {
 			s.lock.Unlock()
 			// logger.Trace().Msg("Ingestor unlocked")
 		}
-		s.closed = true
+		s.closed.Store(true)
 		s.lock.Lock()
 		if len(s.data) == 0 {
 			s.block.Done() // Unblock the emitter so it can exit
@@ -63,10 +66,7 @@ func NewStack[T any](inbuffer, outbuffer int) (*stack[T], <-chan T, chan<- T) {
 
 	// emitter
 	go func() {
-		for {
-			if s.closed {
-				break
-			}
+		for !s.closed.Load() {
 			// logger.Trace().Msg("Emitter waiting")
 			s.block.Wait() // Wait for some data to show up
 			// logger.Trace().Msg("Emitter done waiting")
