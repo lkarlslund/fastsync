@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -22,8 +25,9 @@ import (
 )
 
 type dashboardReady struct {
-	logWriter zerolog.LevelWriter
-	err       error
+	logWriter   zerolog.LevelWriter
+	interrupted <-chan struct{}
+	err         error
 }
 
 type dashboardLogWriter struct {
@@ -201,15 +205,17 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 	if err != nil {
 		return fmt.Errorf("create dashboard layout: %w", err)
 	}
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 	ready <- dashboardReady{logWriter: &dashboardLogWriter{
 		view: logView,
 		formatter: zerolog.ConsoleWriter{
 			TimeFormat: time.RFC3339,
 			NoColor:    true,
 		},
-	}}
+	}, interrupted: signalCtx.Done()}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
 	go func() {
 		series := map[string][]float64{

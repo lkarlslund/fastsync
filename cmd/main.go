@@ -211,6 +211,7 @@ func main() {
 
 			collector := startStatsCollector(c, time.Second)
 			var tuiDone chan error
+			var interrupted <-chan struct{}
 			clientLogLevel := fastsync.Logger.GetLevel()
 			dashboardActive := false
 			if interactive {
@@ -226,17 +227,35 @@ func main() {
 					tuiDone = nil
 				} else {
 					fastsync.Logger = zerolog.New(dashboard.logWriter).With().Timestamp().Logger().Level(clientLogLevel)
+					interrupted = dashboard.interrupted
 					dashboardActive = true
 				}
 			}
 
-			err = c.Run(rpcClient)
+			rpcClosed := false
+			if dashboardActive {
+				syncDone := make(chan error, 1)
+				go func() {
+					syncDone <- c.Run(rpcClient)
+				}()
+				select {
+				case err = <-syncDone:
+				case <-interrupted:
+					rpcClosed = true
+					_ = rpcClient.Close()
+					err = <-syncDone
+				}
+			} else {
+				err = c.Run(rpcClient)
+			}
 			if err != nil {
 				fastsync.Logger.Error().Msgf("Error running client: %v", err)
 			}
 
-			if err := rpcClient.Close(); err != nil {
-				fastsync.Logger.Error().Msgf("Error closing RPC client: %v", err)
+			if !rpcClosed {
+				if err := rpcClient.Close(); err != nil {
+					fastsync.Logger.Error().Msgf("Error closing RPC client: %v", err)
+				}
 			}
 
 			totalhistory := collector.Stop()
