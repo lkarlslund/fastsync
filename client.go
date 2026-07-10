@@ -30,6 +30,24 @@ type dirinfo struct {
 	remaining    int32
 }
 
+func waitForFileInfo(path string, attempts int, delay time.Duration) (FileInfo, error) {
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		info, err := PathToFileInfo(path)
+		if err == nil {
+			return info, nil
+		}
+		if !os.IsNotExist(err) {
+			return FileInfo{}, err
+		}
+		lastErr = err
+		if attempt+1 < attempts {
+			time.Sleep(delay)
+		}
+	}
+	return FileInfo{}, fmt.Errorf("hardlink target %s did not appear after %d attempts: %w", path, attempts, lastErr)
+}
+
 type Client struct {
 	BasePath string
 
@@ -319,25 +337,18 @@ func (c *Client) Run(client *rpc.Client) error {
 							c.inodesMu.Unlock()
 							if iniSnapshot.localinode == 0 {
 								// Find the local inode, we only need to do this once
-								for {
-									otherlocalfi, err := PathToFileInfo(iniSnapshot.localhardlinkpath)
-									if os.IsNotExist(err) {
-										Logger.Warn().Msgf("Local hardlink path %s does not exist, delaying a bit", iniSnapshot.localhardlinkpath)
-										time.Sleep(10 * time.Millisecond)
-									} else if err != nil {
-										Logger.Error().Msgf("Error getting hardlink stat for local path %s: %v", iniSnapshot.localhardlinkpath, err)
-										continue
-									} else {
-										c.inodesMu.Lock()
-										if i, found := c.inodes[key]; found && i.localinode == 0 {
-											i.localinode = otherlocalfi.Inode
-											i.localdev = otherlocalfi.Dev
-											iniSnapshot = *i
-										}
-										c.inodesMu.Unlock()
-										break
-									}
+								otherlocalfi, err := waitForFileInfo(iniSnapshot.localhardlinkpath, 100, 10*time.Millisecond)
+								if err != nil {
+									Logger.Error().Msgf("Hardlink target unavailable for %s: %v", localpath, err)
+									return
 								}
+								c.inodesMu.Lock()
+								if i, found := c.inodes[key]; found && i.localinode == 0 {
+									i.localinode = otherlocalfi.Inode
+									i.localdev = otherlocalfi.Dev
+									iniSnapshot = *i
+								}
+								c.inodesMu.Unlock()
 							}
 
 							if localfi.Inode != iniSnapshot.localinode || localfi.Dev != iniSnapshot.localdev {
@@ -406,23 +417,11 @@ func (c *Client) Run(client *rpc.Client) error {
 							c.inodesMu.Unlock()
 							if localpath != iniSnapshot.localhardlinkpath {
 								Logger.Debug().Msgf("Hardlinking %s to %s", localpath, iniSnapshot.localhardlinkpath)
-								var retries int
-								for {
+								if _, err = waitForFileInfo(iniSnapshot.localhardlinkpath, 100, 10*time.Millisecond); err == nil {
 									err = os.Link(iniSnapshot.localhardlinkpath, localpath)
-									if err != nil {
-										if os.IsNotExist(err) {
-											retries++
-											if retries < 25 {
-												time.Sleep(100 * time.Millisecond)
-												continue
-											}
-										}
-										Logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, iniSnapshot.localhardlinkpath, err)
-										break
-									}
-									break
 								}
 								if err != nil {
+									Logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, iniSnapshot.localhardlinkpath, err)
 									return
 								}
 								create_file = false

@@ -327,3 +327,14 @@ func TestClientRejectsInvalidQueueSettings(t *testing.T) {
 		})
 	}
 }
+
+func TestWaitForFileInfoIsBoundedWhenHardlinkTargetIsMissing(t *testing.T) {
+	started := time.Now()
+	_, err := waitForFileInfo(filepath.Join(t.TempDir(), "missing"), 3, time.Millisecond)
+	if err == nil {
+		t.Fatal("waitForFileInfo succeeded for missing path")
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("waitForFileInfo took %v, want bounded retry", elapsed)
+	}
+}
