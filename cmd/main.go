@@ -211,11 +211,23 @@ func main() {
 
 			collector := startStatsCollector(c, time.Second)
 			var tuiDone chan error
+			clientLogLevel := fastsync.Logger.GetLevel()
+			dashboardActive := false
 			if interactive {
 				tuiDone = make(chan error, 1)
+				ready := make(chan dashboardReady, 1)
 				go func() {
-					tuiDone <- showStatsTUI(collector.samples)
+					tuiDone <- showStatsTUI(collector.samples, ready)
 				}()
+				dashboard := <-ready
+				if dashboard.err != nil {
+					fastsync.Logger.Error().Msgf("Dashboard error: %v", dashboard.err)
+					_ = <-tuiDone
+					tuiDone = nil
+				} else {
+					fastsync.Logger = zerolog.New(dashboard.logWriter).With().Timestamp().Logger().Level(clientLogLevel)
+					dashboardActive = true
+				}
 			}
 
 			err = c.Run(rpcClient)
@@ -229,7 +241,11 @@ func main() {
 
 			totalhistory := collector.Stop()
 			if tuiDone != nil {
-				if tuiErr := <-tuiDone; tuiErr != nil {
+				tuiErr := <-tuiDone
+				if dashboardActive {
+					configureConsoleLogger(clientLogLevel, false)
+				}
+				if tuiErr != nil {
 					fastsync.Logger.Error().Msgf("Dashboard error: %v", tuiErr)
 				}
 			}

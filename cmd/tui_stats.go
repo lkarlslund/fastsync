@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/lkarlslund/fastsync"
@@ -14,7 +16,48 @@ import (
 	"github.com/mum4k/termdash/terminal/terminalapi"
 	"github.com/mum4k/termdash/widgets/linechart"
 	"github.com/mum4k/termdash/widgets/text"
+	"github.com/rs/zerolog"
 )
+
+type dashboardReady struct {
+	logWriter zerolog.LevelWriter
+	err       error
+}
+
+type dashboardLogWriter struct {
+	mu        sync.Mutex
+	view      *text.Text
+	formatter zerolog.ConsoleWriter
+}
+
+func (w *dashboardLogWriter) Write(p []byte) (int, error) {
+	return w.WriteLevel(zerolog.NoLevel, p)
+}
+
+func (w *dashboardLogWriter) WriteLevel(level zerolog.Level, p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var formatted bytes.Buffer
+	formatter := w.formatter
+	formatter.Out = &formatted
+	if _, err := formatter.Write(p); err != nil {
+		return 0, err
+	}
+	color := cell.ColorWhite
+	switch level {
+	case zerolog.TraceLevel, zerolog.DebugLevel:
+		color = cell.ColorNumber(245)
+	case zerolog.WarnLevel:
+		color = cell.ColorYellow
+	case zerolog.ErrorLevel, zerolog.FatalLevel, zerolog.PanicLevel:
+		color = cell.ColorRed
+	}
+	if err := w.view.Write(formatted.String(), text.WriteCellOpts(cell.FgColor(color))); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
 
 type stats struct {
 	startTime                                time.Time
@@ -81,7 +124,15 @@ func (c *statsCollector) Stop() fastsync.PerformanceEntry {
 }
 
 // showStatsTUI displays transfer activity until statsCh is closed.
-func showStatsTUI(statsCh <-chan stats) error {
+func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			select {
+			case ready <- dashboardReady{err: retErr}:
+			default:
+			}
+		}
+	}()
 	terminal, err := tcell.New(tcell.ColorMode(terminalapi.ColorMode256))
 	if err != nil {
 		return fmt.Errorf("open terminal: %w", err)
@@ -107,9 +158,6 @@ func showStatsTUI(statsCh <-chan stats) error {
 	if err != nil {
 		return fmt.Errorf("create log view: %w", err)
 	}
-	if err := logView.Write("Application logs"); err != nil {
-		return fmt.Errorf("initialize log view: %w", err)
-	}
 
 	root, err := container.New(terminal,
 		container.SplitHorizontal(
@@ -125,6 +173,13 @@ func showStatsTUI(statsCh <-chan stats) error {
 	if err != nil {
 		return fmt.Errorf("create dashboard layout: %w", err)
 	}
+	ready <- dashboardReady{logWriter: &dashboardLogWriter{
+		view: logView,
+		formatter: zerolog.ConsoleWriter{
+			TimeFormat: time.RFC3339,
+			NoColor:    true,
+		},
+	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
