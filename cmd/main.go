@@ -17,7 +17,28 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 	"github.com/ugorji/go/codec"
+	"golang.org/x/term"
 )
+
+func terminalMode(stdinTTY, stdoutTTY bool, termName string) bool {
+	return stdinTTY && stdoutTTY && termName != "" && termName != "dumb"
+}
+
+func interactiveTerminal() bool {
+	return terminalMode(
+		term.IsTerminal(int(os.Stdin.Fd())),
+		term.IsTerminal(int(os.Stdout.Fd())),
+		strings.ToLower(os.Getenv("TERM")),
+	)
+}
+
+func configureConsoleLogger(level zerolog.Level, noColor bool) {
+	fastsync.Logger = zerolog.New(zerolog.ConsoleWriter{
+		Out:        os.Stderr,
+		TimeFormat: time.RFC3339,
+		NoColor:    noColor,
+	}).With().Timestamp().Logger().Level(level)
+}
 
 var (
 	// General/root options
@@ -49,7 +70,7 @@ func main() {
 			default:
 				fastsync.Logger.Fatal().Msgf("Invalid log level: %v", loglevel)
 			}
-			fastsync.Logger = fastsync.Logger.Level(zll)
+			configureConsoleLogger(zll, !term.IsTerminal(int(os.Stderr.Fd())))
 
 			// CPU profiling setup
 			if cpuprofile == "auto" {
@@ -156,6 +177,10 @@ func main() {
 				fastsync.Logger.Fatal().Msgf("Please provide server address and port to connect to")
 			}
 			serveraddr := args[0]
+			interactive := interactiveTerminal()
+			if !interactive {
+				configureConsoleLogger(fastsync.Logger.GetLevel(), true)
+			}
 
 			c := fastsync.NewClient()
 			c.BasePath = directory
@@ -185,11 +210,14 @@ func main() {
 			fastsync.Logger.Info().Msgf("Client processing with up to %v incoming file blocks at %v bytes (RAM usage could be %v bytes or more)", c.ParallelFile, c.BlockSize, c.ParallelFile*c.BlockSize)
 
 			collector := startStatsCollector(c, time.Second)
-			tuiDone := make(chan struct{})
-			go func() {
-				defer close(tuiDone)
-				showStatsTUI(collector.samples)
-			}()
+			var tuiDone chan struct{}
+			if interactive {
+				tuiDone = make(chan struct{})
+				go func() {
+					defer close(tuiDone)
+					showStatsTUI(collector.samples)
+				}()
+			}
 
 			err = c.Run(rpcClient)
 			if err != nil {
@@ -201,7 +229,9 @@ func main() {
 			}
 
 			totalhistory := collector.Stop()
-			<-tuiDone
+			if tuiDone != nil {
+				<-tuiDone
+			}
 
 			fastsync.Logger.Warn().Msgf("Final statistics")
 			fastsync.Logger.Warn().Msgf("Wired %v, transferred %v, local read/write %v processed %v - %v files - %v dirs",

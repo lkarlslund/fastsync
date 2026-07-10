@@ -44,7 +44,7 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 				return
 			}
 			inodes, directories, files, stack := client.Stats()
-			collector.samples <- stats{
+			sample := stats{
 				startTime:      time.Now(),
 				performance:    history,
 				total:          total,
@@ -52,6 +52,10 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 				directorycache: directories,
 				files:          files,
 				stack:          stack,
+			}
+			select {
+			case collector.samples <- sample:
+			default:
 			}
 		}
 		for {
