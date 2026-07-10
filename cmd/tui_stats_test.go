@@ -48,6 +48,27 @@ func TestDashboardLogWriterAcceptsConcurrentEvents(t *testing.T) {
 	workers.Wait()
 }
 
+func TestSanitizeDashboardText(t *testing.T) {
+	input := "Screenshot at 5.05.52\u202fAM\tquote\u0085scan\n"
+	want := "Screenshot at 5.05.52 AM    quote\\u0085scan\n"
+	if got := sanitizeDashboardText(input); got != want {
+		t.Fatalf("sanitizeDashboardText() = %q, want %q", got, want)
+	}
+}
+
+func TestDashboardLogWriterAcceptsUnsupportedFilenameCharacters(t *testing.T) {
+	view, err := text.New(text.RollContent(), text.MaxTextCells(4096))
+	if err != nil {
+		t.Fatalf("new text widget: %v", err)
+	}
+	writer := &dashboardLogWriter{
+		view:      view,
+		formatter: zerolog.ConsoleWriter{NoColor: true},
+	}
+	logger := zerolog.New(writer)
+	logger.Info().Msg("Screenshot at 5.05.52\u202fAM quote\u0085scan")
+}
+
 func TestTerminalMode(t *testing.T) {
 	tests := []struct {
 		name                string

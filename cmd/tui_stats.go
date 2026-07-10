@@ -10,6 +10,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/dustin/go-humanize"
 	"github.com/lkarlslund/fastsync"
@@ -59,10 +60,30 @@ func (w *dashboardLogWriter) WriteLevel(level zerolog.Level, p []byte) (int, err
 	case zerolog.ErrorLevel, zerolog.FatalLevel, zerolog.PanicLevel:
 		color = cell.ColorRed
 	}
-	if err := w.view.Write(formatted.String(), text.WriteCellOpts(cell.FgColor(color))); err != nil {
+	if err := w.view.Write(sanitizeDashboardText(formatted.String()), text.WriteCellOpts(cell.FgColor(color))); err != nil {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+func sanitizeDashboardText(value string) string {
+	var sanitized strings.Builder
+	sanitized.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r == '\n' || r == ' ':
+			sanitized.WriteRune(r)
+		case r == '\t':
+			sanitized.WriteString("    ")
+		case unicode.IsControl(r):
+			fmt.Fprintf(&sanitized, "\\u%04x", r)
+		case unicode.IsSpace(r):
+			sanitized.WriteByte(' ')
+		default:
+			sanitized.WriteRune(r)
+		}
+	}
+	return sanitized.String()
 }
 
 type stats struct {
