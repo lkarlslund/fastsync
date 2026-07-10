@@ -2,6 +2,7 @@ package fastsync
 
 import (
 	"io"
+	"sync"
 	"sync/atomic"
 
 	"github.com/klauspost/compress/s2"
@@ -88,14 +89,14 @@ func (pe PerformanceEntry) Get(pc PerformanceCounterType) uint64 {
 }
 
 type performance struct {
-	current    atomic.Pointer[PerformanceEntry]
+	current    [maxperformancecountertype]atomic.Uint64
+	historyMu  sync.Mutex
 	maxhistory int
 	entries    []PerformanceEntry
 }
 
 func NewPerformance() *performance {
 	p := performance{}
-	p.current.Store(&PerformanceEntry{})
 	p.maxhistory = 300
 	return &p
 }
@@ -107,25 +108,28 @@ func (p *performance) GetAtomicAdder(ct PerformanceCounterType) AtomicAdder {
 }
 
 func (p *performance) Add(ct PerformanceCounterType, v uint64) {
-	pc := p.current.Load()
-	atomic.AddUint64(&pc.counters[ct], v)
+	p.current[ct].Add(v)
 }
 
 func (p *performance) Get(ct PerformanceCounterType) uint64 {
-	pc := p.current.Load()
-	return atomic.LoadUint64(&pc.counters[ct])
+	return p.current[ct].Load()
 }
 
 func (p *performance) NextHistory() PerformanceEntry {
-	newhistory := PerformanceEntry{}
-	oldhistory := p.current.Swap(&newhistory)
+	var history PerformanceEntry
+	for i := range history.counters {
+		history.counters[i] = p.current[i].Swap(0)
+	}
+
+	p.historyMu.Lock()
+	defer p.historyMu.Unlock()
 	if len(p.entries) >= p.maxhistory {
 		copy(p.entries, p.entries[1:])
-		p.entries[len(p.entries)-1] = *oldhistory
+		p.entries[len(p.entries)-1] = history
 	} else {
-		p.entries = append(p.entries, *oldhistory)
+		p.entries = append(p.entries, history)
 	}
-	return *oldhistory
+	return history
 }
 
 type PerformanceWrapperReadWriteCloser struct {

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sort"
+	"sync"
 	"testing"
 )
 
@@ -35,6 +36,42 @@ func TestCompressedReadWriteCloserRoundTrip(t *testing.T) {
 	}
 	if err := rightCompressed.Close(); err != nil {
 		t.Fatalf("close right compressed conn: %v", err)
+	}
+}
+
+func TestPerformanceHistoryDoesNotLoseConcurrentAdds(t *testing.T) {
+	p := NewPerformance()
+	const goroutines = 8
+	const additions = 1000
+
+	var workers sync.WaitGroup
+	workers.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer workers.Done()
+			for range additions {
+				p.Add(WrittenBytes, 1)
+			}
+		}()
+	}
+
+	var total PerformanceEntry
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	for {
+		total = total.Add(p.NextHistory())
+		select {
+		case <-done:
+			total = total.Add(p.NextHistory())
+			if got, want := total.Get(WrittenBytes), uint64(goroutines*additions); got != want {
+				t.Fatalf("collected WrittenBytes = %d, want %d", got, want)
+			}
+			return
+		default:
+		}
 	}
 }
 
