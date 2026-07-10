@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -66,5 +67,24 @@ func TestTerminalMode(t *testing.T) {
 				t.Fatalf("terminalMode() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFormatStatsIncludesQueuesAndTotals(t *testing.T) {
+	var current, total fastsync.PerformanceEntry
+	// Build entries through the public performance API because counters are intentionally opaque.
+	client := fastsync.NewClient()
+	client.Perf.Add(fastsync.WrittenBytes, 1024)
+	client.Perf.Add(fastsync.FilesProcessed, 2)
+	current = client.Perf.NextHistory()
+	total = total.Add(current)
+	got := formatStats(stats{
+		performance: current, total: total, elapsed: 2 * time.Second,
+		inodecache: 3, directorycache: 4, files: 5, stack: 6,
+	})
+	for _, want := range []string{"Local write  1.0 kB/s", "Files total  2", "File queue   5", "Dir stack    6", "Inode cache  3", "Dir cache    4"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatStats() missing %q:\n%s", want, got)
+		}
 	}
 }

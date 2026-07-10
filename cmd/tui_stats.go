@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/lkarlslund/fastsync"
 	"github.com/mum4k/termdash"
 	"github.com/mum4k/termdash/cell"
@@ -61,6 +63,7 @@ func (w *dashboardLogWriter) WriteLevel(level zerolog.Level, p []byte) (int, err
 
 type stats struct {
 	startTime                                time.Time
+	elapsed                                  time.Duration
 	performance                              fastsync.PerformanceEntry
 	total                                    fastsync.PerformanceEntry
 	inodecache, directorycache, files, stack int
@@ -83,6 +86,7 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		var total fastsync.PerformanceEntry
+		started := time.Now()
 		collect := func(publish bool) {
 			history := client.Perf.NextHistory()
 			total = total.Add(history)
@@ -92,6 +96,7 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 			inodes, directories, files, stack := client.Stats()
 			sample := stats{
 				startTime:      time.Now(),
+				elapsed:        time.Since(started),
 				performance:    history,
 				total:          total,
 				inodecache:     inodes,
@@ -116,6 +121,29 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 		}
 	}()
 	return collector
+}
+
+func formatStats(sample stats) string {
+	current := sample.performance
+	total := sample.total
+	var out strings.Builder
+	fmt.Fprintf(&out, "Status       Running\n")
+	fmt.Fprintf(&out, "Elapsed      %s\n\n", sample.elapsed.Round(time.Second))
+	fmt.Fprintf(&out, "Wire         %s/s\n", humanize.Bytes(current.Get(fastsync.SentOverWire)+current.Get(fastsync.RecievedOverWire)))
+	fmt.Fprintf(&out, "Payload      %s/s\n", humanize.Bytes(current.Get(fastsync.SentBytes)+current.Get(fastsync.RecievedBytes)))
+	fmt.Fprintf(&out, "Local read   %s/s\n", humanize.Bytes(current.Get(fastsync.ReadBytes)))
+	fmt.Fprintf(&out, "Local write  %s/s\n", humanize.Bytes(current.Get(fastsync.WrittenBytes)))
+	fmt.Fprintf(&out, "Processed    %s/s\n", humanize.Bytes(current.Get(fastsync.BytesProcessed)))
+	fmt.Fprintf(&out, "Files        %d/s\n", current.Get(fastsync.FilesProcessed))
+	fmt.Fprintf(&out, "Directories  %d/s\n\n", current.Get(fastsync.DirectoriesProcessed))
+	fmt.Fprintf(&out, "Transferred  %s\n", humanize.Bytes(total.Get(fastsync.SentBytes)+total.Get(fastsync.RecievedBytes)))
+	fmt.Fprintf(&out, "Files total  %d\n", total.Get(fastsync.FilesProcessed))
+	fmt.Fprintf(&out, "Dirs total   %d\n\n", total.Get(fastsync.DirectoriesProcessed))
+	fmt.Fprintf(&out, "File queue   %d\n", sample.files)
+	fmt.Fprintf(&out, "Dir stack    %d\n", sample.stack)
+	fmt.Fprintf(&out, "Inode cache  %d\n", sample.inodecache)
+	fmt.Fprintf(&out, "Dir cache    %d\n", sample.directorycache)
+	return out.String()
 }
 
 func (c *statsCollector) Stop() fastsync.PerformanceEntry {
@@ -195,6 +223,8 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 			"wire": cell.ColorYellow, "processed": cell.ColorMagenta,
 		}
 		for sample := range statsCh {
+			statsView.Reset()
+			_ = statsView.Write(formatStats(sample))
 			values := map[string]uint64{
 				"read": sample.performance.Get(fastsync.ReadBytes), "written": sample.performance.Get(fastsync.WrittenBytes),
 				"wire": sample.performance.Get(fastsync.RecievedOverWire), "processed": sample.performance.Get(fastsync.BytesProcessed),
