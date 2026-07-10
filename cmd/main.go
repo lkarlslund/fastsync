@@ -147,8 +147,6 @@ func main() {
 		paralleldir           int
 		queuesize             int
 		transferblocksize     int
-		transferstatsinterval int
-		queuestatsinterval    int
 	)
 	var clientCmd = &cobra.Command{
 		Use:   "client",
@@ -234,8 +232,6 @@ func main() {
 			fastsync.Logger.Warn().Msgf("Deleted %v", totalhistory.Get(fastsync.EntriesDeleted))
 		},
 	}
-	clientCmd.Flags().IntVar(&transferstatsinterval, "statsinterval", 5, "Show transfer stats every N seconds, 0 to disable")
-	clientCmd.Flags().IntVar(&queuestatsinterval, "queueinterval", 30, "Show internal queue sizes every N seconds, 0 to disable")
 	clientCmd.Flags().BoolVar(&hardlinks, "hardlinks", true, "Preserve hardlinks")
 	clientCmd.Flags().BoolVar(&xattr, "xattr", true, "Transfer xattrs")
 	clientCmd.Flags().BoolVar(&checksum, "checksum", false, "Checksum files")
