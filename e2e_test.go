@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/ugorji/go/codec"
@@ -25,9 +26,21 @@ func newTestRPCClient(t *testing.T, sourceDir string) *rpc.Client {
 	rpcServer := rpc.NewServer()
 	server := NewServer()
 	server.BasePath = sourceDir
-	if err := rpcServer.Register(server); err != nil {
+	registerTestRPCServer(t, rpcServer, server)
+
+	return newTestRPCClientForServer(t, rpcServer)
+}
+
+func registerTestRPCServer(t *testing.T, rpcServer *rpc.Server, server any) {
+	t.Helper()
+
+	if err := rpcServer.RegisterName("Server", server); err != nil {
 		t.Fatalf("register server: %v", err)
 	}
+}
+
+func newTestRPCClientForServer(t *testing.T, rpcServer *rpc.Server) *rpc.Client {
+	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -242,5 +255,75 @@ func TestClientServerSyncPreservesHardlinks(t *testing.T) {
 	}
 	if a.Dev != b.Dev || a.Inode != b.Inode {
 		t.Fatalf("destination files are not hardlinked: a=%d/%d b=%d/%d", a.Dev, a.Inode, b.Dev, b.Inode)
+	}
+}
+
+type failingListServer struct {
+	*Server
+	failPath string
+}
+
+func (s *failingListServer) List(path string, reply *FileListResponse) error {
+	if path == s.failPath {
+		return errors.New("forced list failure")
+	}
+	return s.Server.List(path, reply)
+}
+
+func TestClientServerSyncListErrorDoesNotHang(t *testing.T) {
+	source := t.TempDir()
+	dest := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(source, "bad"), 0o755); err != nil {
+		t.Fatalf("mkdir bad source dir: %v", err)
+	}
+
+	rpcServer := rpc.NewServer()
+	server := NewServer()
+	server.BasePath = source
+	registerTestRPCServer(t, rpcServer, &failingListServer{
+		Server:   server,
+		failPath: "/bad",
+	})
+	rpcClient := newTestRPCClientForServer(t, rpcServer)
+
+	client := newTestClient(dest)
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Run(rpcClient)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("client run returned unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client run did not finish after a child directory list failure")
+	}
+
+	if _, directories, _, stack := client.Stats(); directories != 0 || stack != 0 {
+		t.Fatalf("client queues after failed list: directories=%d stack=%d, want both 0", directories, stack)
+	}
+}
+
+func TestClientRejectsInvalidQueueSettings(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*Client)
+	}{
+		{name: "no directory workers", configure: func(client *Client) { client.ParallelDir = 0 }},
+		{name: "no file workers", configure: func(client *Client) { client.ParallelFile = 0 }},
+		{name: "negative queue size", configure: func(client *Client) { client.QueueSize = -1 }},
+		{name: "zero block size", configure: func(client *Client) { client.BlockSize = 0 }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newTestClient(t.TempDir())
+			tt.configure(client)
+			if err := client.Run(nil); err == nil {
+				t.Fatal("Client.Run succeeded with invalid queue settings, want error")
+			}
+		})
 	}
 }
