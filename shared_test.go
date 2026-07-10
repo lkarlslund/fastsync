@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestCompressedReadWriteCloserRoundTrip(t *testing.T) {
@@ -139,5 +140,32 @@ func TestStackEmitsSubmittedItemsAndCloses(t *testing.T) {
 		if item != i {
 			t.Fatalf("sorted item %d = %d, want %d; all items %v", i, item, i, got)
 		}
+	}
+}
+
+func TestStackAcceptsRecursiveWorkWhenOutputIsBackpressured(t *testing.T) {
+	stack, out, in := NewStack[int](1, 1)
+	in <- 1
+	in <- 2
+
+	queued := make(chan struct{})
+	go func() {
+		in <- 3
+		in <- 4
+		close(queued)
+	}()
+	select {
+	case <-queued:
+	case <-time.After(time.Second):
+		t.Fatal("stack stopped accepting input while output was backpressured")
+	}
+
+	stack.Close()
+	var got []int
+	for item := range out {
+		got = append(got, item)
+	}
+	if len(got) != 4 {
+		t.Fatalf("received %d items, want 4: %v", len(got), got)
 	}
 }
