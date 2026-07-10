@@ -66,7 +66,6 @@ func (w *dashboardLogWriter) WriteLevel(level zerolog.Level, p []byte) (int, err
 }
 
 type stats struct {
-	startTime                                time.Time
 	elapsed                                  time.Duration
 	performance                              fastsync.PerformanceEntry
 	total                                    fastsync.PerformanceEntry
@@ -99,7 +98,6 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 			}
 			inodes, directories, files, stack := client.Stats()
 			sample := stats{
-				startTime:      time.Now(),
 				elapsed:        time.Since(started),
 				performance:    history,
 				total:          total,
@@ -127,6 +125,31 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 	return collector
 }
 
+const maxGraphSamples = 60
+
+type graphSeries struct {
+	localRead, localWrite, receivedOverWire, processed []float64
+}
+
+func appendGraphSample(series graphSeries, sample stats, capacity int) graphSeries {
+	limit := maxGraphSamples
+	if capacity > 0 && capacity < limit {
+		limit = capacity
+	}
+	appendValue := func(values []float64, value uint64) []float64 {
+		values = append(values, float64(value))
+		if len(values) > limit {
+			values = values[len(values)-limit:]
+		}
+		return values
+	}
+	series.localRead = appendValue(series.localRead, sample.performance.Get(fastsync.ReadBytes))
+	series.localWrite = appendValue(series.localWrite, sample.performance.Get(fastsync.WrittenBytes))
+	series.receivedOverWire = appendValue(series.receivedOverWire, sample.performance.Get(fastsync.RecievedOverWire))
+	series.processed = appendValue(series.processed, sample.performance.Get(fastsync.BytesProcessed))
+	return series
+}
+
 func formatStats(sample stats) string {
 	current := sample.performance
 	total := sample.total
@@ -148,6 +171,25 @@ func formatStats(sample stats) string {
 	fmt.Fprintf(&out, "Inode cache  %d\n", sample.inodecache)
 	fmt.Fprintf(&out, "Dir cache    %d\n", sample.directorycache)
 	return out.String()
+}
+
+func writeStats(view *text.Text, sample stats) error {
+	view.Reset()
+	legend := []struct {
+		label string
+		color cell.Color
+	}{
+		{label: "[] Local read", color: cell.ColorGreen},
+		{label: "[] Local write", color: cell.ColorBlue},
+		{label: "[] Wire receive", color: cell.ColorYellow},
+		{label: "[] Processed", color: cell.ColorMagenta},
+	}
+	for _, item := range legend {
+		if err := view.Write(item.label+"\n", text.WriteCellOpts(cell.FgColor(item.color))); err != nil {
+			return err
+		}
+	}
+	return view.Write("\n" + formatStats(sample))
 }
 
 func (c *statsCollector) Stop() fastsync.PerformanceEntry {
@@ -173,8 +215,9 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 
 	chart, err := linechart.New(
 		linechart.YAxisFormattedValues(func(value float64) string {
-			return fmt.Sprintf("%.0f", value)
+			return humanize.Bytes(uint64(value)) + "/s"
 		}),
+		linechart.XAxisUnscaled(),
 	)
 	if err != nil {
 		return fmt.Errorf("create throughput chart: %w", err)
@@ -218,29 +261,26 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
 	go func() {
-		series := map[string][]float64{
-			"read":      {},
-			"written":   {},
-			"wire":      {},
-			"processed": {},
-		}
-		colors := map[string]cell.Color{
-			"read": cell.ColorGreen, "written": cell.ColorBlue,
-			"wire": cell.ColorYellow, "processed": cell.ColorMagenta,
-		}
+		var series graphSeries
 		for sample := range statsCh {
-			statsView.Reset()
-			_ = statsView.Write(formatStats(sample))
-			values := map[string]uint64{
-				"read": sample.performance.Get(fastsync.ReadBytes), "written": sample.performance.Get(fastsync.WrittenBytes),
-				"wire": sample.performance.Get(fastsync.RecievedOverWire), "processed": sample.performance.Get(fastsync.BytesProcessed),
+			if err := writeStats(statsView, sample); err != nil {
+				fastsync.Logger.Error().Msgf("Update dashboard statistics: %v", err)
 			}
-			for name, value := range values {
-				series[name] = append(series[name], float64(value))
-				if len(series[name]) > 60 {
-					series[name] = series[name][len(series[name])-60:]
+			series = appendGraphSample(series, sample, chart.ValueCapacity())
+			updates := []struct {
+				name   string
+				values []float64
+				color  cell.Color
+			}{
+				{name: "Local read", values: series.localRead, color: cell.ColorGreen},
+				{name: "Local write", values: series.localWrite, color: cell.ColorBlue},
+				{name: "Wire receive", values: series.receivedOverWire, color: cell.ColorYellow},
+				{name: "Processed", values: series.processed, color: cell.ColorMagenta},
+			}
+			for _, update := range updates {
+				if err := chart.Series(update.name, update.values, linechart.SeriesCellOpts(cell.FgColor(update.color))); err != nil {
+					fastsync.Logger.Error().Msgf("Update dashboard graph: %v", err)
 				}
-				_ = chart.Series(name, series[name], linechart.SeriesCellOpts(cell.FgColor(colors[name])))
 			}
 		}
 		cancel()

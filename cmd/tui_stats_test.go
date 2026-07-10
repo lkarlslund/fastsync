@@ -88,3 +88,33 @@ func TestFormatStatsIncludesQueuesAndTotals(t *testing.T) {
 		}
 	}
 }
+
+func TestAppendGraphSampleKeepsVisibleWindow(t *testing.T) {
+	client := fastsync.NewClient()
+	var series graphSeries
+	for i := 1; i <= 10; i++ {
+		client.Perf.Add(fastsync.ReadBytes, uint64(i))
+		series = appendGraphSample(series, stats{performance: client.Perf.NextHistory()}, 4)
+	}
+	if got, want := len(series.localRead), 4; got != want {
+		t.Fatalf("visible samples = %d, want %d", got, want)
+	}
+	if got, want := series.localRead[0], float64(7); got != want {
+		t.Fatalf("first visible sample = %.0f, want %.0f", got, want)
+	}
+}
+
+func TestAppendGraphSampleDropsAgedSpike(t *testing.T) {
+	client := fastsync.NewClient()
+	client.Perf.Add(fastsync.BytesProcessed, 1_000_000)
+	series := appendGraphSample(graphSeries{}, stats{performance: client.Perf.NextHistory()}, 3)
+	for range 3 {
+		client.Perf.Add(fastsync.BytesProcessed, 10)
+		series = appendGraphSample(series, stats{performance: client.Perf.NextHistory()}, 3)
+	}
+	for _, value := range series.processed {
+		if value == 1_000_000 {
+			t.Fatal("aged spike remains in visible graph window")
+		}
+	}
+}

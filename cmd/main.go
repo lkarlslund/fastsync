@@ -223,7 +223,7 @@ func main() {
 				dashboard := <-ready
 				if dashboard.err != nil {
 					fastsync.Logger.Error().Msgf("Dashboard error: %v", dashboard.err)
-					_ = <-tuiDone
+					<-tuiDone
 					tuiDone = nil
 				} else {
 					fastsync.Logger = zerolog.New(dashboard.logWriter).With().Timestamp().Logger().Level(clientLogLevel)
