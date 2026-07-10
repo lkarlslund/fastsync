@@ -139,14 +139,14 @@ func main() {
 
 	// Client command
 	var (
-		hardlinks             bool
-		xattr                 bool
-		checksum              bool
-		deleteOpt             bool
-		parallelfile          int
-		paralleldir           int
-		queuesize             int
-		transferblocksize     int
+		hardlinks         bool
+		xattr             bool
+		checksum          bool
+		deleteOpt         bool
+		parallelfile      int
+		paralleldir       int
+		queuesize         int
+		transferblocksize int
 	)
 	var clientCmd = &cobra.Command{
 		Use:   "client",
@@ -182,31 +182,13 @@ func main() {
 			rpcCodec := codec.GoRpc.ClientCodec(wcconn, &h)
 			rpcClient := rpc.NewClientWithCodec(rpcCodec)
 
-			var totalhistory fastsync.PerformanceEntry
-
 			fastsync.Logger.Info().Msgf("Client processing with up to %v incoming file blocks at %v bytes (RAM usage could be %v bytes or more)", c.ParallelFile, c.BlockSize, c.ParallelFile*c.BlockSize)
 
-			statsCh := make(chan stats, 10)
-			go showStatsTUI(statsCh)
+			collector := startStatsCollector(c, time.Second)
+			tuiDone := make(chan struct{})
 			go func() {
-				ticker := time.NewTicker(time.Second)
-				defer ticker.Stop()
-				for !c.Done() {
-					<-ticker.C
-
-					lasthistory := c.Perf.NextHistory()
-					totalhistory = totalhistory.Add(lasthistory)
-					inodecache, directorycache, files, stack := c.Stats()
-
-					statsCh <- stats{
-						startTime:      time.Now(),
-						performance:    lasthistory,
-						inodecache:     inodecache,
-						directorycache: directorycache,
-						files:          files,
-						stack:          stack,
-					}
-				}
+				defer close(tuiDone)
+				showStatsTUI(collector.samples)
 			}()
 
 			err = c.Run(rpcClient)
@@ -218,8 +200,8 @@ func main() {
 				fastsync.Logger.Error().Msgf("Error closing RPC client: %v", err)
 			}
 
-			lasthistory := c.Perf.NextHistory()
-			totalhistory = totalhistory.Add(lasthistory)
+			totalhistory := collector.Stop()
+			<-tuiDone
 
 			fastsync.Logger.Warn().Msgf("Final statistics")
 			fastsync.Logger.Warn().Msgf("Wired %v, transferred %v, local read/write %v processed %v - %v files - %v dirs",

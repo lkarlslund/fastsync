@@ -16,7 +16,61 @@ import (
 type stats struct {
 	startTime                                time.Time
 	performance                              fastsync.PerformanceEntry
+	total                                    fastsync.PerformanceEntry
 	inodecache, directorycache, files, stack int
+}
+
+type statsCollector struct {
+	stop    chan struct{}
+	done    chan fastsync.PerformanceEntry
+	samples chan stats
+}
+
+func startStatsCollector(client *fastsync.Client, interval time.Duration) *statsCollector {
+	collector := &statsCollector{
+		stop:    make(chan struct{}),
+		done:    make(chan fastsync.PerformanceEntry, 1),
+		samples: make(chan stats, 10),
+	}
+	go func() {
+		defer close(collector.samples)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		var total fastsync.PerformanceEntry
+		collect := func(publish bool) {
+			history := client.Perf.NextHistory()
+			total = total.Add(history)
+			if !publish {
+				return
+			}
+			inodes, directories, files, stack := client.Stats()
+			collector.samples <- stats{
+				startTime:      time.Now(),
+				performance:    history,
+				total:          total,
+				inodecache:     inodes,
+				directorycache: directories,
+				files:          files,
+				stack:          stack,
+			}
+		}
+		for {
+			select {
+			case <-ticker.C:
+				collect(true)
+			case <-collector.stop:
+				collect(false)
+				collector.done <- total
+				return
+			}
+		}
+	}()
+	return collector
+}
+
+func (c *statsCollector) Stop() fastsync.PerformanceEntry {
+	close(c.stop)
+	return <-c.done
 }
 
 // ShowStatsTUI displays a TUI timeseries chart of byte values from the provided channel.

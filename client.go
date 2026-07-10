@@ -43,8 +43,6 @@ type Client struct {
 	PreserveHardlinks                    bool
 	BlockSize                            int
 
-	shutdown, done bool
-
 	dirWorkerWG, fileWorkerWG sync.WaitGroup
 
 	filequeue chan FileInfo
@@ -672,14 +670,6 @@ func (c *Client) PostProcessDir(item *dirinfo) {
 	}
 }
 
-func (c *Client) Abort() {
-	c.shutdown = true
-}
-
-func (c *Client) Done() bool {
-	return c.done
-}
-
 func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
 	c.inodesMu.Lock()
 	inodes = len(c.inodes)
@@ -690,8 +680,4 @@ func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
 	c.dircacheMu.Unlock()
 
 	return inodes, directories, len(c.filequeue), c.dirstack.Len()
-}
-
-func (c *Client) Wait() {
-	c.fileWorkerWG.Wait()
 }
