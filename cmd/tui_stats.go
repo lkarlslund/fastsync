@@ -1,16 +1,19 @@
 package main
 
 import (
-	"os"
-	"os/signal"
-	"syscall"
+	"context"
+	"fmt"
 	"time"
 
-	"github.com/NimbleMarkets/ntcharts/linechart/timeserieslinechart"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/dustin/go-humanize"
 	"github.com/lkarlslund/fastsync"
-	"golang.org/x/term"
+	"github.com/mum4k/termdash"
+	"github.com/mum4k/termdash/cell"
+	"github.com/mum4k/termdash/container"
+	"github.com/mum4k/termdash/linestyle"
+	"github.com/mum4k/termdash/terminal/tcell"
+	"github.com/mum4k/termdash/terminal/terminalapi"
+	"github.com/mum4k/termdash/widgets/linechart"
+	"github.com/mum4k/termdash/widgets/text"
 )
 
 type stats struct {
@@ -77,89 +80,83 @@ func (c *statsCollector) Stop() fastsync.PerformanceEntry {
 	return <-c.done
 }
 
-// ShowStatsTUI displays a TUI timeseries chart of byte values from the provided channel.
-func showStatsTUI(statsCh <-chan stats) {
-	getTermSize := func() (int, int) {
-		w, h, err := term.GetSize(int(os.Stdout.Fd()))
-		if err != nil {
-			return 80, 24 // fallback
+// showStatsTUI displays transfer activity until statsCh is closed.
+func showStatsTUI(statsCh <-chan stats) error {
+	terminal, err := tcell.New(tcell.ColorMode(terminalapi.ColorMode256))
+	if err != nil {
+		return fmt.Errorf("open terminal: %w", err)
+	}
+	defer terminal.Close()
+
+	chart, err := linechart.New(
+		linechart.YAxisFormattedValues(func(value float64) string {
+			return fmt.Sprintf("%.0f", value)
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("create throughput chart: %w", err)
+	}
+	statsView, err := text.New(text.WrapAtWords())
+	if err != nil {
+		return fmt.Errorf("create statistics view: %w", err)
+	}
+	if err := statsView.Write("Waiting for statistics..."); err != nil {
+		return fmt.Errorf("initialize statistics view: %w", err)
+	}
+	logView, err := text.New(text.RollContent(), text.WrapAtWords(), text.MaxTextCells(64*1024))
+	if err != nil {
+		return fmt.Errorf("create log view: %w", err)
+	}
+	if err := logView.Write("Application logs"); err != nil {
+		return fmt.Errorf("initialize log view: %w", err)
+	}
+
+	root, err := container.New(terminal,
+		container.SplitHorizontal(
+			container.Top(container.SplitVertical(
+				container.Left(container.Border(linestyle.Light), container.BorderTitle("Throughput"), container.PlaceWidget(chart)),
+				container.Right(container.Border(linestyle.Light), container.BorderTitle("Statistics"), container.PlaceWidget(statsView)),
+				container.SplitPercent(75),
+			)),
+			container.Bottom(container.Border(linestyle.Light), container.BorderTitle("Log"), container.PlaceWidget(logView)),
+			container.SplitPercent(65),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("create dashboard layout: %w", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		series := map[string][]float64{
+			"read":      {},
+			"written":   {},
+			"wire":      {},
+			"processed": {},
 		}
-		return w, h
-	}
-
-	width, height := getTermSize()
-	chartHeight := height / 2
-
-	tslc := timeserieslinechart.New(width, chartHeight)
-	tslc.XLabelFormatter = timeserieslinechart.HourTimeLabelFormatter()
-	tslc.UpdateHandler = timeserieslinechart.SecondUpdateHandler(1)
-
-	tslc.YLabelFormatter = func(i int, v float64) string {
-		return humanize.Bytes(uint64(v)) + "/s"
-	}
-
-	tslc.SetDataSetStyle("localRead",
-		lipgloss.NewStyle().
-			Foreground(lipgloss.Color("10")), // green
-	)
-	tslc.SetDataSetStyle("localWritten",
-		lipgloss.NewStyle().
-			Foreground(lipgloss.Color("12")), // blue
-	)
-	tslc.SetDataSetStyle("recievedOverWire",
-		lipgloss.NewStyle().
-			Foreground(lipgloss.Color("11")), // yellow
-	)
-	tslc.SetDataSetStyle("processed",
-		lipgloss.NewStyle().
-			Foreground(lipgloss.Color("13")), // magenta
-	)
-
-	tslc.DrawXYAxisAndLabel()
-
-	resizeCh := make(chan os.Signal, 1)
-	signal.Notify(resizeCh, syscall.SIGWINCH)
-
-	clearAndDraw := func(view string) {
-		// Move cursor to top-left and clear only the chart area
-		_, _ = os.Stdout.Write([]byte("\033[H"))
-		for i := 0; i < chartHeight+2; i++ {
-			_, _ = os.Stdout.Write([]byte("\033[2K\r")) // clear line
+		colors := map[string]cell.Color{
+			"read": cell.ColorGreen, "written": cell.ColorBlue,
+			"wire": cell.ColorYellow, "processed": cell.ColorMagenta,
 		}
-		_, _ = os.Stdout.Write([]byte("\033[H"))
-		_, _ = os.Stdout.Write([]byte(view))
-	}
-
-	for {
-		select {
-		case <-resizeCh:
-			w, h := getTermSize()
-			chartHeight = h / 2
-			tslc.Resize(w, chartHeight)
-		case curStat, ok := <-statsCh:
-			if !ok {
-				return
+		for sample := range statsCh {
+			values := map[string]uint64{
+				"read": sample.performance.Get(fastsync.ReadBytes), "written": sample.performance.Get(fastsync.WrittenBytes),
+				"wire": sample.performance.Get(fastsync.RecievedOverWire), "processed": sample.performance.Get(fastsync.BytesProcessed),
 			}
-
-			lasthistory := curStat.performance
-			fastsync.Logger.Warn().Msgf("Wired %v/sec, transferred %v/sec, local read %v/sec, local write %v/sec, processed %v/sec, %v files/sec, %v dirs/sec",
-				humanize.Bytes((lasthistory.Get(fastsync.SentOverWire) + lasthistory.Get(fastsync.RecievedOverWire))),
-				humanize.Bytes((lasthistory.Get(fastsync.SentBytes) + lasthistory.Get(fastsync.RecievedBytes))),
-				humanize.Bytes(lasthistory.Get(fastsync.ReadBytes)), humanize.Bytes((lasthistory.Get(fastsync.WrittenBytes))),
-				humanize.Bytes((lasthistory.Get(fastsync.BytesProcessed))),
-				(lasthistory.Get(fastsync.FilesProcessed)),
-				(lasthistory.Get(fastsync.DirectoriesProcessed)))
-
-			// tslc.Push(timeserieslinechart.TimePoint{Time: curStat.startTime, Value: float64(curStat.performance.Get(fastsync.ReadBytes))})
-			tslc.PushDataSet("localRead", timeserieslinechart.TimePoint{Time: curStat.startTime, Value: float64(curStat.performance.Get(fastsync.ReadBytes))})
-			tslc.PushDataSet("localWritten", timeserieslinechart.TimePoint{Time: curStat.startTime, Value: float64(curStat.performance.Get(fastsync.WrittenBytes))})
-			tslc.PushDataSet("recievedOverWire", timeserieslinechart.TimePoint{Time: curStat.startTime, Value: float64(curStat.performance.Get(fastsync.RecievedOverWire))})
-			tslc.PushDataSet("processed", timeserieslinechart.TimePoint{Time: curStat.startTime, Value: float64(curStat.performance.Get(fastsync.BytesProcessed))})
-			tslc.SetViewTimeRange(curStat.startTime.Add(-60*time.Second), curStat.startTime)
-
-			tslc.DrawBrailleAll()
-			view := tslc.View()
-			clearAndDraw(view)
+			for name, value := range values {
+				series[name] = append(series[name], float64(value))
+				if len(series[name]) > 60 {
+					series[name] = series[name][len(series[name])-60:]
+				}
+				_ = chart.Series(name, series[name], linechart.SeriesCellOpts(cell.FgColor(colors[name])))
+			}
 		}
+		cancel()
+	}()
+
+	if err := termdash.Run(ctx, terminal, root, termdash.RedrawInterval(250*time.Millisecond)); err != nil {
+		return fmt.Errorf("run dashboard: %w", err)
 	}
+	return nil
 }

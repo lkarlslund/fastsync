@@ -210,12 +210,11 @@ func main() {
 			fastsync.Logger.Info().Msgf("Client processing with up to %v incoming file blocks at %v bytes (RAM usage could be %v bytes or more)", c.ParallelFile, c.BlockSize, c.ParallelFile*c.BlockSize)
 
 			collector := startStatsCollector(c, time.Second)
-			var tuiDone chan struct{}
+			var tuiDone chan error
 			if interactive {
-				tuiDone = make(chan struct{})
+				tuiDone = make(chan error, 1)
 				go func() {
-					defer close(tuiDone)
-					showStatsTUI(collector.samples)
+					tuiDone <- showStatsTUI(collector.samples)
 				}()
 			}
 
@@ -230,7 +229,9 @@ func main() {
 
 			totalhistory := collector.Stop()
 			if tuiDone != nil {
-				<-tuiDone
+				if tuiErr := <-tuiDone; tuiErr != nil {
+					fastsync.Logger.Error().Msgf("Dashboard error: %v", tuiErr)
+				}
 			}
 
 			fastsync.Logger.Warn().Msgf("Final statistics")
