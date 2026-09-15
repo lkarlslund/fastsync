@@ -34,15 +34,15 @@ func TestHistoryRightEdgeAndStack(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if v.Rune == '█' || v.Rune == '•' {
+				if v.Rune == '█' || (v.Rune > 0x2800 && v.Rune <= 0x28ff) {
 					occupied++
 				}
 			}
 			if occupied == 0 {
 				t.Fatalf("blank newest column: width=%d stacked=%v", width, stacked)
 			}
-			if stacked && occupied != 8 {
-				t.Fatalf("stack height=%d want 8", occupied)
+			if stacked && occupied != 6 {
+				t.Fatalf("stack height=%d want 6", occupied)
 			}
 		}
 	}
@@ -50,8 +50,8 @@ func TestHistoryRightEdgeAndStack(t *testing.T) {
 func TestHistoryExpiresByTime(t *testing.T) {
 	h := historyChart{}
 	h.add(stats{elapsed: time.Second})
-	h.add(stats{elapsed: 62 * time.Second})
-	if len(h.samples) != 1 {
+	h.add(stats{elapsed: (maxChartBuckets + 2) * time.Second})
+	if len(h.buckets[0]) != 1 {
 		t.Fatal("aged sample retained")
 	}
 }

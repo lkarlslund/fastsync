@@ -86,7 +86,9 @@ func (c *Client) scheduleFiles(client *rpc.Client) {
 							c.recordError("%s: %v", j.remote.Name, err)
 						} else {
 							c.Perf.Add(FilesProcessed, 1)
-							c.Perf.Add(BytesProcessed, uint64(j.remote.Size))
+							if j.entry != nil && !j.follower {
+								c.saveResumeHint(j.remote)
+							}
 						}
 						// Directory finalization can perform RPC and metadata IO;
 						// never block the dispatcher on it.
@@ -104,14 +106,58 @@ func (c *Client) scheduleFiles(client *rpc.Client) {
 	enqueue := func(stage int, j *scheduledFile) { j.queued = time.Now(); queues[stage] = append(queues[stage], j) }
 	var checkSequence uint64
 	checked := orderedChecks{pending: make(map[uint64]fileCompletion)}
+	// Only needed when preservation is disabled: source hardlinks still count
+	// once for statistics, even though each destination file is copied separately.
+	type byteGroup struct {
+		remaining uint64
+		counted   bool
+	}
+	var byteGroups map[inodeKey]*byteGroup
 	finish := func(result fileCompletion) {
 		j := result.job
 		if result.err == nil && result.stage == 0 && j.work != nil {
 			enqueue(1, j)
 			return
 		}
+		if j.remote.Mode.IsRegular() {
+			counted := false
+			var group *byteGroup
+			key := inodeKey{j.remote.Dev, j.remote.Inode}
+			if j.entry != nil {
+				counted = j.entry.bytesCounted
+			} else if j.remote.Nlink > 1 {
+				if byteGroups == nil {
+					byteGroups = make(map[inodeKey]*byteGroup)
+				}
+				group = byteGroups[key]
+				if group == nil {
+					group = &byteGroup{remaining: j.remote.Nlink}
+					byteGroups[key] = group
+				}
+				counted = group.counted
+			}
+			if result.err == nil {
+				c.Perf.Add(BytesProcessed, uint64(j.remote.Size))
+				if !counted {
+					c.Perf.Add(BytesUniqueProcessed, uint64(j.remote.Size))
+					if j.entry != nil {
+						j.entry.bytesCounted = true
+					}
+					if group != nil {
+						group.counted = true
+					}
+				}
+			}
+			if group != nil {
+				group.remaining--
+				if group.remaining == 0 {
+					delete(byteGroups, key)
+				}
+			}
+		}
 		if j.entry != nil {
 			if !j.follower {
+
 				j.entry.err = result.err
 				close(j.entry.done)
 				for _, f := range waiting[j.entry] {

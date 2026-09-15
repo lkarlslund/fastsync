@@ -206,6 +206,9 @@ func (c *Client) Tuning() TransferTuning {
 	defer c.tuningMu.Unlock()
 	state := c.tuningState
 	state.Phase = c.phase.Load()
+	if c.shutdownRequested.Load() && state.Phase != 4 && state.Phase != 5 {
+		state.Phase = 6
+	}
 	state.CheckQueue = c.stageQueued[0].Load()
 	state.CopyQueue = c.stageQueued[1].Load()
 	state.LinkQueue = c.stageQueued[2].Load()

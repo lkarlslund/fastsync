@@ -99,6 +99,7 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 	}
 	entry.localhardlinkpath = path
 	entry.seed = &reuseSeed{source: remote, local: local}
+	c.saveResumeHint(remote)
 	return nil
 }
 

@@ -51,8 +51,13 @@ func TestWarmupErrorContinuesCopyButFailsRun(t *testing.T) {
 			registerTestRPCServer(t, registry, s)
 			c := newTestClient(dst)
 			c.PreserveHardlinks = true
+			c.ResumeCache = filepath.Join(t.TempDir(), "cache")
+			c.ResumeIdentity = "synthetic-snapshot"
 			if err := c.Run(newTestRPCClientForServer(t, registry)); err == nil {
 				t.Fatal("warmup error was forgotten")
+			}
+			if data, err := os.ReadFile(c.ResumeCache); err != nil || len(data) == 0 {
+				t.Fatalf("error exit did not save cache: %v", err)
 			}
 			if got := readTestFile(t, dst, "good/file"); got != "copy me" {
 				t.Fatal("unrelated copy aborted")

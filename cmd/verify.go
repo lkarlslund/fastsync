@@ -22,6 +22,10 @@ func newVerifyCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use: "verify server:port", Short: "Read-only archive verification with a JSON-lines report", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			password, e := readPasswordFile(passwordFile)
+			if e != nil {
+				return e
+			}
 			var output io.Writer = cmd.OutOrStdout()
 			if report != "" {
 				// Reports must not change the tree being verified, or overwrite an older report.
@@ -63,6 +67,7 @@ func newVerifyCommand() *cobra.Command {
 			rpcClient := rpc.NewClientWithCodec(codec.GoRpc.ClientCodec(fastsync.CompressedReadWriteCloser(conn), &h))
 			defer func() { err = errors.Join(err, rpcClient.Close()) }()
 			client := fastsync.NewClient()
+			client.Password = password
 			client.BasePath = directory
 			client.SourcePath = sourcePath
 			client.Options.SendXattr = attrs

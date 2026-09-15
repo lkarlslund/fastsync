@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/rpc"
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/metrics"
 	"runtime/pprof"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -48,6 +51,8 @@ var (
 	cpuprofile       string
 	cpuprofilelength int
 	ramlimit         uint64
+	passwordFile     string
+	memoryAbort      = make(chan error, 1)
 )
 
 func main() {
@@ -73,7 +78,11 @@ func main() {
 			}
 			configureConsoleLogger(zll, !term.IsTerminal(int(os.Stderr.Fd())))
 			if ramlimit > 0 {
-				startMemoryWatch(ramlimit)
+				if cmd.Name() == "client" {
+					startMemoryWatch(ramlimit, memoryAbort)
+				} else {
+					startMemoryWatch(ramlimit)
+				}
 			}
 
 			// CPU profiling setup
@@ -114,6 +123,7 @@ func main() {
 	}
 
 	// Root persistent flags
+	rootCmd.PersistentFlags().StringVar(&passwordFile, "password-file", "", "Owner-only file containing the shared password (server/client/verify/shutdown)")
 	rootCmd.PersistentFlags().StringVar(&directory, "directory", ".", "Directory to use as source or target")
 	rootCmd.PersistentFlags().StringVar(&loglevel, "loglevel", "info", "Log level")
 	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "Write cpu profile to file (filename, use 'auto' to trigger auto profiling)")
@@ -129,7 +139,12 @@ func main() {
 		Use:   "server",
 		Short: "Run as server",
 		Run: func(cmd *cobra.Command, args []string) {
+			password, err := readPasswordFile(passwordFile)
+			if err != nil {
+				fastsync.Logger.Fatal().Err(err).Msg("Invalid password file")
+			}
 			fastsyncserver := fastsync.NewServer()
+			fastsyncserver.ConfigurePassword(password)
 			fastsyncserver.BasePath = directory
 			if err := fastsyncserver.ConfigureMetadata(serverMetadata); err != nil {
 				fastsync.Logger.Fatal().Err(err).Msg("Invalid metadata limit")
@@ -142,6 +157,7 @@ func main() {
 			if err != nil {
 				fastsync.Logger.Fatal().Msgf("Error binding listener: %v", err)
 			}
+			shutdownReplied := make(chan struct{}, 1)
 			fastsync.Logger.Info().Msgf("Listening on %s", bind)
 			go func() {
 				for {
@@ -163,12 +179,13 @@ func main() {
 							return
 						}
 						var h codec.MsgpackHandle
-						rpcserver.ServeCodec(codec.GoRpc.ServerCodec(wcconn, &h))
+						rpcserver.ServeCodec(&shutdownReplyCodec{ServerCodec: codec.GoRpc.ServerCodec(wcconn, &h), replied: shutdownReplied})
 						fastsync.Logger.Info().Msgf("Closed connection from %v", conn.RemoteAddr())
 					}()
 				}
 			}()
 			fastsyncserver.Wait()
+			<-shutdownReplied
 			_ = listener.Close()
 		},
 	}
@@ -190,6 +207,8 @@ func main() {
 		transferblocksize int
 	)
 	var sourcePath string
+	var resumeCache, resumeIdentity string
+	var resumePosition bool
 	var pipeline, autoTune bool
 	var flushInterval time.Duration
 	var flushBytes int64
@@ -201,9 +220,9 @@ func main() {
 		SilenceUsage: true,
 		Use:          "client",
 		Short:        "Run as client",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
 			if len(args) < 1 {
-				fastsync.Logger.Fatal().Msgf("Please provide server address and port to connect to")
+				return errors.New("please provide server address and port to connect to")
 			}
 			serveraddr := args[0]
 			interactive := interactiveTerminal()
@@ -213,6 +232,11 @@ func main() {
 
 			c := fastsync.NewClient()
 			c.BasePath = directory
+			c.ResumeCache = resumeCache
+			c.ResumePosition = resumePosition
+			if resumeIdentity != "" {
+				c.ResumeIdentity = serveraddr + "/" + sourcePath + "/" + resumeIdentity
+			}
 			c.Pipeline = pipeline || autoTune
 			c.AutoTune = autoTune
 			c.FlushInterval = flushInterval
@@ -236,26 +260,11 @@ func main() {
 
 			sourceLabel := strings.TrimSuffix(serveraddr, "/") + "/" + strings.TrimPrefix(c.SourcePath, "/")
 			copyMessage := fmt.Sprintf("Copying from %s to %s", sourceLabel, c.BasePath)
-			fastsync.Logger.Info().Msg(copyMessage)
-			conn, err := net.Dial("tcp", serveraddr)
-			if err != nil {
-				fastsync.Logger.Fatal().Msgf("Error connecting to %s: %v", serveraddr, err)
-			}
-			fastsync.Logger.Info().Msgf("Connected to %s", serveraddr)
-
-			wconn := fastsync.NewPerformanceWrapper(conn, c.Perf.GetAtomicAdder(fastsync.RecievedOverWire), c.Perf.GetAtomicAdder(fastsync.SentOverWire))
-			cconn := fastsync.CompressedReadWriteCloser(wconn)
-			wcconn := fastsync.NewPerformanceWrapper(cconn, c.Perf.GetAtomicAdder(fastsync.RecievedBytes), c.Perf.GetAtomicAdder(fastsync.SentBytes))
-
-			var h codec.MsgpackHandle
-			rpcCodec := codec.GoRpc.ClientCodec(wcconn, &h)
-			rpcClient := rpc.NewClientWithCodec(rpcCodec)
-
-			fastsync.Logger.Info().Msgf("Client processing with up to %v incoming file blocks at %v bytes (RAM usage could be %v bytes or more)", c.ParallelFile, c.BlockSize, c.ParallelFile*c.BlockSize)
-
 			collector := startStatsCollector(c, time.Second)
 			var tuiDone chan error
-			var interrupted <-chan struct{}
+			signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+			defer stopSignals()
+			interrupted := signalCtx.Done()
 			clientLogLevel := fastsync.Logger.GetLevel()
 			dashboardActive := false
 			if interactive {
@@ -271,27 +280,86 @@ func main() {
 					tuiDone = nil
 				} else {
 					fastsync.Logger = zerolog.New(dashboard.logWriter).With().Timestamp().Logger().Level(clientLogLevel)
-					fastsync.Logger.Info().Msg(copyMessage)
-					interrupted = dashboard.interrupted
 					dashboardActive = true
 				}
 			}
 
+			collectorStopped := false
+			var finalTotals fastsync.PerformanceEntry
+			stopCollector := func() fastsync.PerformanceEntry {
+				if !collectorStopped {
+					finalTotals = collector.Stop()
+					collectorStopped = true
+				}
+				return finalTotals
+			}
+			dashboardStopped := false
+			finishDashboard := func() fastsync.PerformanceEntry {
+				dashboardStopped = true
+				total := stopCollector()
+				close(collector.samples)
+				if tuiDone != nil {
+					tuiErr := <-tuiDone
+					if dashboardActive {
+						configureConsoleLogger(clientLogLevel, false)
+					}
+					if tuiErr != nil {
+						fastsync.Logger.Error().Err(tuiErr).Msg("Dashboard error")
+					}
+				}
+				return total
+			}
+			defer func() {
+				if !dashboardStopped {
+					if err != nil {
+						fastsync.Logger.Error().Err(err).Msg("Client startup failed")
+					}
+					finishDashboard()
+				}
+			}()
+			fastsync.Logger.Info().Msg(copyMessage)
+			var passwordErr error
+			c.Password, passwordErr = readPasswordFile(passwordFile)
+			if passwordErr != nil {
+				return passwordErr
+			}
+			conn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(signalCtx, "tcp", serveraddr)
+			if err != nil {
+				return fmt.Errorf("connect to %s: %w", serveraddr, err)
+			}
+			fastsync.Logger.Info().Msgf("Connected to %s", serveraddr)
+
+			wconn := fastsync.NewPerformanceWrapper(conn, c.Perf.GetAtomicAdder(fastsync.RecievedOverWire), c.Perf.GetAtomicAdder(fastsync.SentOverWire))
+			cconn := fastsync.CompressedReadWriteCloser(wconn)
+			wcconn := fastsync.NewPerformanceWrapper(cconn, c.Perf.GetAtomicAdder(fastsync.RecievedBytes), c.Perf.GetAtomicAdder(fastsync.SentBytes))
+
+			var h codec.MsgpackHandle
+			rpcCodec := codec.GoRpc.ClientCodec(wcconn, &h)
+			rpcClient := rpc.NewClientWithCodec(rpcCodec)
+
+			fastsync.Logger.Info().Msgf("Client processing with up to %v incoming file blocks at %v bytes (RAM usage could be %v bytes or more)", c.ParallelFile, c.BlockSize, c.ParallelFile*c.BlockSize)
+
 			rpcClosed := false
-			if dashboardActive {
+			{
 				syncDone := make(chan error, 1)
 				go func() {
 					syncDone <- c.Run(rpcClient)
 				}()
 				select {
 				case err = <-syncDone:
+				case memoryErr := <-memoryAbort:
+					c.NotifyShutdown()
+					fastsync.Logger.Warn().Msg("Memory limit reached; shutting down and saving resume state")
+					rpcClosed = true
+					_ = rpcClient.Close()
+					err = errors.Join(<-syncDone, memoryErr)
 				case <-interrupted:
+					c.NotifyShutdown()
+					fastsync.Logger.Info().Msg("Shutdown requested; finishing pending writes and saving resume state. Please wait.")
 					rpcClosed = true
 					_ = rpcClient.Close()
 					err = errors.Join(<-syncDone, errors.New("transfer interrupted"))
 				}
-			} else {
-				err = c.Run(rpcClient)
 			}
 			if err != nil {
 				fastsync.Logger.Error().Msgf("Error running client: %v", err)
@@ -301,16 +369,8 @@ func main() {
 				err = errors.Join(err, rpcClient.Close())
 			}
 
-			totalhistory := collector.Stop()
-			if tuiDone != nil {
-				tuiErr := <-tuiDone
-				if dashboardActive {
-					configureConsoleLogger(clientLogLevel, false)
-				}
-				if tuiErr != nil {
-					fastsync.Logger.Error().Msgf("Dashboard error: %v", tuiErr)
-				}
-			}
+			fastsync.Logger.Info().Msg("Transfer cleanup complete")
+			totalhistory := stopCollector()
 
 			fastsync.Logger.Warn().Msgf("Final statistics")
 			fastsync.Logger.Warn().Msgf("Wired %v, transferred %v, local read/write %v - %v files - %v dirs",
@@ -319,11 +379,16 @@ func main() {
 				humanize.Bytes(totalhistory.Get(fastsync.ReadBytes)+totalhistory.Get(fastsync.WrittenBytes)),
 				totalhistory.Get(fastsync.FilesProcessed),
 				totalhistory.Get(fastsync.DirectoriesProcessed))
+			fastsync.Logger.Warn().Msgf("Processed data %s (all paths), unique data %s (once per source inode)", humanize.Bytes(totalhistory.Get(fastsync.BytesProcessed)), humanize.Bytes(totalhistory.Get(fastsync.BytesUniqueProcessed)))
 			fastsync.Logger.Warn().Msgf("Existing pass: examined %d paths, found %d reusable inode groups", totalhistory.Get(fastsync.ExistingExamined), totalhistory.Get(fastsync.ReuseGroups))
 			fastsync.Logger.Warn().Msgf("Deleted %v", totalhistory.Get(fastsync.EntriesDeleted))
+			finishDashboard()
 			return err
 		},
 	}
+	clientCmd.Flags().BoolVar(&resumePosition, "resume-position", false, "Skip checkpointed top-level subtrees; requires an immutable source and exclusively managed destination")
+	clientCmd.Flags().StringVar(&resumeCache, "resume-cache", "", "Persistent hardlink hint cache outside the destination")
+	clientCmd.Flags().StringVar(&resumeIdentity, "resume-id", "", "Stable source snapshot identity for the resume cache")
 	clientCmd.Flags().Int64Var(&flushBytes, "flush-bytes", 256<<20, "Maximum written bytes awaiting file flush")
 	clientCmd.Flags().IntVar(&flushFiles, "flush-files", 64, "Maximum files awaiting flush, including open files")
 	clientCmd.Flags().IntVar(&flushWorkers, "flush-workers", 64, "Maximum background file-flush workers (share destination IO limit)")
@@ -364,8 +429,12 @@ func main() {
 			cconn := fastsync.CompressedReadWriteCloser(conn)
 			rpcCodec := codec.GoRpc.ClientCodec(cconn, &h)
 			rpcClient := rpc.NewClientWithCodec(rpcCodec)
-			options := fastsync.SharedOptions{ProtocolVersion: fastsync.PROTOCOLVERSION}
-			if err := rpcClient.Call("Server.Hello", &options, nil); err != nil {
+			client := fastsync.NewClient()
+			client.Password, err = readPasswordFile(passwordFile)
+			if err != nil {
+				fastsync.Logger.Fatal().Err(err).Msg("Invalid password file")
+			}
+			if err := client.Handshake(rpcClient); err != nil {
 				fastsync.Logger.Fatal().Msgf("Error saying hello: %v", err)
 			}
 			fastsync.Logger.Info().Msg("Shutting down server")

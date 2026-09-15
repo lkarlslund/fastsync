@@ -20,7 +20,7 @@ Use the same build on both hosts. The old binary on a source host must be replac
 
 Expose the complete directory for **one backed-up server**, containing every dated version. Copy that whole tree in one invocation so hardlinks between versions are tracked together. All destination versions must be on the same filesystem and, for Btrfs, the same subvolume.
 
-The server uses unauthenticated TCP. Bind to loopback and forward it over SSH:
+The transport is unencrypted TCP, with optional password authentication (see below). Bind to loopback and forward it over SSH:
 
 ```sh
 # On the source host, serving one server's complete history:
@@ -76,7 +76,7 @@ Telemetry is optional: older servers, unsupported platforms, and stale responses
 - `--delete` defaults to false. It removes extra **destination** entries for mirroring. Leave it disabled for archive migration. Verification rejects deletion.
 - `--ramlimit` defaults to zero (disabled). A nonzero value samples Linux process RSS every 100 ms and aborts with a nonzero exit when exceeded; other platforms use Go-managed memory. This is a sampled abort guard, not a hard allocation limit. An abrupt memory-limit exit can leave staging files and an incomplete report. Use an OS memory limit as well when a hard ceiling is required.
 
-Directory listings and inode indexes still consume memory proportional to the work. Copying one server at a time limits their scope; links outside the selected tree can keep inode entries alive until the run ends. Verification retains indexes for linked inodes to check relationships. There is no disk-backed index yet. Leave capacity for the OS, filesystem compression and bees; size the FastSync memory guard and deduplication limit to leave sufficient host memory available.
+Directory listings and inode indexes still consume memory proportional to the work. Copying one server at a time limits their scope; links outside the selected tree can keep inode entries alive until the run ends. Verification retains indexes for linked inodes to check relationships. An optional [persistent resume cache](docs/resume-cache.md) saves hardlink hints and completed-subtree checkpoints; it is not a full file inventory. Leave capacity for the OS, filesystem compression and bees; size the FastSync memory guard and deduplication limit to leave sufficient host memory available.
 
 ## Tests
 
@@ -117,3 +117,30 @@ subtrees and warms the inode cache from qualifying existing hardlinked files.
 Missing subtrees are skipped. The second pass reuses those destination inodes
 before copying unresolved groups. No missing-file inventory is retained; both
 passes walk alphabetically. Metadata repairs and deletion occur only in pass 2.
+
+## Password authentication and compatibility
+
+Password protection is optional. Set `--password-file /path/to/credential` on
+both server and client (and on `verify` or `shutdown`). The file must contain one
+nonempty line and be readable only by its owner, such as mode 0600. A trailing
+newline is ignored; spaces are preserved. Empty, missing, or overly permissive
+files fail rather than disabling authentication. Omitting the option on both
+ends keeps password-free operation. Supplying it on only one end is an error.
+Do not put a real credential in command arguments, source control, or example
+configuration. For archive loops, set `password_file` in the loop's private configuration;
+the wrapper passes the file path to both copy and verification.
+
+The handshake uses a fresh connection-specific challenge and HMAC-SHA-256 proofs
+in both directions. Passwords themselves are not transmitted. Use a strong,
+random shared password: a captured exchange permits offline password guessing.
+This provides access control, not transport encryption or protection against an
+active intermediary. Continue using an SSH tunnel on untrusted networks. An
+authenticated peer can read the served tree and request shutdown; there are no
+per-user roles. Protect the credential file accordingly.
+
+Both endpoints must match **protocol version 4 and behavior version 4** exactly.
+The client checks the server's versions before authentication/source selection;
+the server checks the client's versions before enabling access. Legacy peers,
+missing versions, and mismatches fail without a downgrade. Both binaries must
+be upgraded together; differently built binaries can interoperate when these
+compatibility versions match. See `AGENTS.md` for the mandatory version-bump rule.

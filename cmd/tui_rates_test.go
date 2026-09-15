@@ -43,7 +43,7 @@ func TestFlushRatesUseCompletedByteCounter(t *testing.T) {
 	if r.instant != 30 || r.total != 160 {
 		t.Fatalf("flush %+v", r)
 	}
-	if s := formatStats(stats{}); strings.Contains(s, "Completed*") || strings.Contains(s, "Processed") {
+	if s := formatStats(stats{}); strings.Contains(s, "Completed*") {
 		t.Fatal(s)
 	}
 }

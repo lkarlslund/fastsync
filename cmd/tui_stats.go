@@ -4,11 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode"
 
@@ -26,9 +23,8 @@ import (
 )
 
 type dashboardReady struct {
-	logWriter   zerolog.LevelWriter
-	interrupted <-chan struct{}
-	err         error
+	logWriter zerolog.LevelWriter
+	err       error
 }
 
 type dashboardLogWriter struct {
@@ -110,7 +106,6 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 		samples: make(chan stats, 10),
 	}
 	go func() {
-		defer close(collector.samples)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		var total fastsync.PerformanceEntry
@@ -160,62 +155,80 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 }
 
 func formatStats(sample stats) string {
-	current := sample.performance
-	total := sample.total
 	var out strings.Builder
-	fmt.Fprintf(&out, "Status       Running\n")
+	phase := "STARTING"
 	if sample.tuning.Phase == 1 {
-		fmt.Fprintln(&out, "Pass         Existing files")
+		phase = "WARMING EXISTING FILES"
 	} else if sample.tuning.Phase == 2 {
-		fmt.Fprintln(&out, "Pass         Link/copy")
+		phase = "COPYING / LINKING"
 	}
-	fmt.Fprintf(&out, "Reuse groups %d\n", total.Get(fastsync.ReuseGroups))
+	switch sample.tuning.Phase {
+	case 3:
+		phase = "LOADING INODE CACHE"
+	case 4:
+		phase = "FLUSHING DATA"
+	case 5:
+		phase = "SAVING RESUME CACHE"
+	case 6:
+		phase = "SHUTTING DOWN"
+	}
+	if sample.tuning.Phase == 3 {
+		fmt.Fprintf(&out, "Validated hints %s\nLoaded inodes   %s\n", humanize.Comma(int64(sample.total.Get(fastsync.ExistingExamined))), humanize.Comma(int64(sample.inodecache)))
+	}
+	fmt.Fprintf(&out, "● %s  ·  %s\n", phase, sample.elapsed.Round(time.Second))
 	label := sample.bottleneck.Label
 	if label == "" {
 		label = "Unknown"
 	}
-	fmt.Fprintf(&out, "Bottleneck   %s\n", label)
-	if sample.tuning.FileLimit > 0 {
-		fmt.Fprintf(&out, "Read limit   %d\nWrite limit  %d (%d active)\nStream files %d/%d\nBuffer bound %s/%s\n", sample.tuning.ReadLimit, sample.tuning.WriteLimit, sample.tuning.ActiveWrites, sample.tuning.ActiveFiles, sample.tuning.FileLimit, humanize.Bytes(uint64(sample.tuning.BufferReserved)), humanize.Bytes(uint64(sample.tuning.BufferLimit)))
+	fmt.Fprintf(&out, "Bottleneck   %s\n\n", label)
+	fmt.Fprintf(&out, "Processed    %s  (all paths)\nUnique data  %s  (once per inode)\n\n", humanize.Bytes(sample.total.Get(fastsync.BytesProcessed)), humanize.Bytes(sample.total.Get(fastsync.BytesUniqueProcessed)))
+	if n := sample.total.Get(fastsync.ResumeSubtreesSkipped); n > 0 {
+		fmt.Fprintf(&out, "Skipped trees %d (prior checkpoints)\n", n)
 	}
-	if sample.tuning.FlushCount > 0 || sample.tuning.PendingFlushFiles > 0 {
-		fmt.Fprintf(&out, "Flush queue  %d files / %s\nFile flush   %s\n", sample.tuning.PendingFlushFiles, humanize.Bytes(sample.tuning.PendingFlushBytes), sample.tuning.LastFlush.Round(time.Millisecond))
-	}
-
-	fmt.Fprintf(&out, "Elapsed      %s\n\n", sample.elapsed.Round(time.Second))
 	out.WriteString(formatRateTable(sample))
-	fmt.Fprintln(&out)
-	fmt.Fprintf(&out, "Check/copy/link %d/%d/%d\nDependencies %d\n", sample.tuning.CheckQueue, sample.tuning.CopyQueue, sample.tuning.LinkQueue, sample.tuning.Dependencies)
-	if n := current.Get(fastsync.QueueDispatches); n > 0 {
-		fmt.Fprintf(&out, "Queue wait   %s avg\n", (time.Duration(current.Get(fastsync.QueueWaitNanos) / n)).Round(time.Millisecond))
+	fmt.Fprintln(&out, "Graphs  1:1s  2:5s  3:15s  4:1m  L:log")
+	fmt.Fprintln(&out, "\nRESOURCES")
+	t := sample.tuning
+	if t.FileLimit > 0 {
+		fmt.Fprintf(&out, "Buffers      %s %s / %s\n", usageMeter(t.BufferReserved, t.BufferLimit), humanize.Bytes(uint64(t.BufferReserved)), humanize.Bytes(uint64(t.BufferLimit)))
+		fmt.Fprintf(&out, "Streams      %s %d / %d\n", usageMeter(int64(t.ActiveFiles), int64(t.FileLimit)), t.ActiveFiles, t.FileLimit)
+		fmt.Fprintf(&out, "Read / write %d / %d  ·  %d writing\n", t.ReadLimit, t.WriteLimit, t.ActiveWrites)
 	}
-	fmt.Fprintf(&out, "File queue   %d\n", sample.files)
-	fmt.Fprintf(&out, "Dir stack    %d\n", sample.stack)
-	fmt.Fprintf(&out, "Inode cache  %d\n", sample.inodecache)
-	fmt.Fprintf(&out, "Dir cache    %d\n", sample.directorycache)
+	if t.FlushCount > 0 || t.PendingFlushFiles > 0 {
+		fmt.Fprintf(&out, "Flush queue  %d files · %s\nLast flush   %s\n", t.PendingFlushFiles, humanize.Bytes(t.PendingFlushBytes), t.LastFlush.Round(time.Millisecond))
+	}
+	fmt.Fprintf(&out, "Check/copy/link %d/%d/%d\nDependencies %d\n", t.CheckQueue, t.CopyQueue, t.LinkQueue, t.Dependencies)
+	if n := sample.performance.Get(fastsync.QueueDispatches); n > 0 {
+		fmt.Fprintf(&out, "Queue wait   %s avg\n", (time.Duration(sample.performance.Get(fastsync.QueueWaitNanos) / n)).Round(time.Millisecond))
+	}
+	fmt.Fprintf(&out, "File queue   %d   ·   Dir stack    %d\n", sample.files, sample.stack)
+	fmt.Fprintf(&out, "Inode cache  %d   ·   Dir cache    %d\n", sample.inodecache, sample.directorycache)
+	fmt.Fprintf(&out, "Reuse groups %d\n", sample.total.Get(fastsync.ReuseGroups))
 	return out.String()
 }
 
 func writeStats(view *text.Text, sample stats) error {
 	view.Reset()
-	legend := []struct {
-		label string
-		color cell.Color
-	}{
-		{label: "[] Local read", color: cell.ColorGreen},
-		{label: "[] Local write", color: cell.ColorBlue},
-		{label: "[] Wire", color: cell.ColorYellow},
-		{label: "[] Dir", color: cell.ColorCyan},
-		{label: "[] Link", color: cell.ColorYellow},
-		{label: "[] Same", color: cell.ColorGreen},
-		{label: "[] Copied", color: cell.ColorMagenta},
-	}
-	for _, item := range legend {
-		if err := view.Write(item.label+"\n", text.WriteCellOpts(cell.FgColor(item.color))); err != nil {
+	for _, line := range strings.Split(strings.TrimSuffix(formatStats(sample), "\n"), "\n") {
+		color := dashboardInk
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			color = metricColor(fields[0])
+		}
+		if strings.HasPrefix(line, "●") {
+			color = dashboardSame
+		}
+		if strings.HasPrefix(line, "Bottleneck") {
+			color = dashboardWire
+		}
+		if line == "RESOURCES" || strings.HasPrefix(line, "/s") {
+			color = dashboardMuted
+		}
+		if err := view.Write(line+"\n", text.WriteCellOpts(cell.FgColor(color))); err != nil {
 			return err
 		}
 	}
-	return view.Write("\n" + formatStats(sample))
+	return nil
 }
 
 func (c *statsCollector) Stop() fastsync.PerformanceEntry {
@@ -239,8 +252,9 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 	}
 	defer terminal.Close()
 
-	chart := &historyChart{}
-	activity := &historyChart{stacked: true}
+	view := &chartView{}
+	chart := &historyChart{view: view}
+	activity := &historyChart{stacked: true, view: view}
 	statsView, err := text.New()
 	if err != nil {
 		return fmt.Errorf("create statistics view: %w", err)
@@ -253,35 +267,19 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 		return fmt.Errorf("create log view: %w", err)
 	}
 
-	root, err := container.New(terminal,
-		container.SplitVertical(
-			container.Left(container.SplitHorizontal(
-				container.Top(container.SplitVertical(
-					container.Left(container.Border(linestyle.Light), container.BorderTitle("Throughput (bytes/s)"), container.PlaceWidget(chart)),
-					container.Right(container.Border(linestyle.Light), container.BorderTitle("Activity (entries/s)"), container.PlaceWidget(activity)),
-					container.SplitPercent(50),
-				)),
-				container.Bottom(container.Border(linestyle.Light), container.BorderTitle("Log"), container.PlaceWidget(logView)),
-				container.SplitPercent(75),
-			)),
-			container.Right(container.Border(linestyle.Light), container.BorderTitle("Statistics"), container.PlaceWidget(statsView)),
-			container.SplitPercent(60),
-		),
-	)
+	root, err := dashboardLayout(terminal, chart, activity, statsView, logView)
 	if err != nil {
 		return fmt.Errorf("create dashboard layout: %w", err)
 	}
-	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stopSignals()
 	ready <- dashboardReady{logWriter: &dashboardLogWriter{
 		view: logView,
 		formatter: zerolog.ConsoleWriter{
 			TimeFormat: time.RFC3339,
 			NoColor:    true,
 		},
-	}, interrupted: signalCtx.Done()}
+	}}
 
-	ctx, cancel := context.WithCancel(signalCtx)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
 		for sample := range statsCh {
@@ -298,4 +296,22 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 		return fmt.Errorf("run dashboard: %w", err)
 	}
 	return nil
+}
+
+func dashboardLayout(terminal terminalapi.Terminal, chart, activity *historyChart, statsView, logView *text.Text) (*container.Container, error) {
+	return container.New(terminal,
+		container.SplitVertical(
+			container.Left(container.SplitHorizontal(
+				container.Top(container.SplitVertical(
+					container.Left(container.Border(linestyle.Light), container.BorderColor(dashboardBorder), container.BorderTitle(" THROUGHPUT "), container.PlaceWidget(chart)),
+					container.Right(container.Border(linestyle.Light), container.BorderColor(dashboardBorder), container.BorderTitle(" FILE ACTIVITY "), container.PlaceWidget(activity)),
+					container.SplitPercent(50),
+				)),
+				container.Bottom(container.Border(linestyle.Light), container.BorderColor(dashboardBorder), container.BorderTitle(" EVENTS "), container.PlaceWidget(logView)),
+				container.SplitPercent(60),
+			)),
+			container.Right(container.Border(linestyle.Light), container.BorderColor(dashboardBorder), container.BorderTitle(" FASTSYNC "), container.PlaceWidget(statsView)),
+			container.SplitFixedFromEnd(52),
+		),
+	)
 }

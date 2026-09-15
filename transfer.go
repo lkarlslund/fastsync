@@ -88,7 +88,16 @@ func (c *Client) syncIndependentDispatch(client *rpc.Client, remote FileInfo, pa
 			c.Perf.Add(FilesUnchanged, 1)
 			return nil
 		}
-		return c.applyMetadata(local, remote)
+		err := c.applyMetadata(local, remote)
+		if err == nil && c.resume != nil && c.flusher != nil {
+			f, e := openNoFollow(path)
+			if e != nil {
+				return e
+			}
+			defer f.Close()
+			err = f.Sync()
+		}
+		return err
 	} else if !exists || local.Mode&os.ModeType != remote.Mode&os.ModeType ||
 		local.LinkTo != remote.LinkTo || local.Rdev != remote.Rdev ||
 		(local.Nlink > 1 && (compareMetadata(local, remote, c.Options.SendXattr) != nil || c.conflictingLocalInode(local, remote))) {
@@ -146,7 +155,11 @@ func (c *Client) stageRegular(client *rpc.Client, remote FileInfo, path string, 
 			err = errors.Join(err, stage.Close())
 		}
 	}()
-	defer c.finishDataFile(stage)
+	defer func() {
+		if stage != nil {
+			c.finishDataFile(stage)
+		}
+	}()
 	var previous *os.File
 	if exists && local.Mode.IsRegular() {
 		previous, err = openNoFollow(path)
@@ -395,7 +408,11 @@ func (c *Client) stageLocal(client *rpc.Client, remote FileInfo, path string) (e
 			err = errors.Join(err, staged.Close())
 		}
 	}()
-	defer c.finishDataFile(staged)
+	defer func() {
+		if staged != nil {
+			c.finishDataFile(staged)
+		}
+	}()
 	if err = c.timeLocalIO(func() error {
 		return cloneOrCopy(staged, old, c.Perf, func(data []byte) (int, error) { return c.writeData(staged, data) })
 	}); err != nil {

@@ -36,18 +36,21 @@ func TestSelectRootConfinementAndSessionIsolation(t *testing.T) {
 	s := NewServer()
 	s.BasePath = base
 	for _, path := range []string{"../", base, "escape", "missing"} {
-		if err := s.NewSession().SelectRoot(path, nil); err == nil {
+		session := s.NewSession()
+		authenticateTestSession(t, session)
+		if err := session.SelectRoot(path, nil); err == nil {
 			t.Fatalf("accepted %q", path)
 		}
 	}
 	session := s.NewSession()
+	authenticateTestSession(t, session)
 	if err := session.SelectRoot("server-a", nil); err != nil {
 		t.Fatal(err)
 	}
 	if s.BasePath != base || s.NewSession().BasePath != base {
 		t.Fatal("changed listener root")
 	}
-	if err := session.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION}, nil); err != nil {
+	if err := session.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION, BehaviorVersion: BEHAVIORVERSION}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := session.SelectRoot(".", nil); err == nil {

@@ -21,9 +21,14 @@ func TestStatsCollectorDrainsFinalCounters(t *testing.T) {
 	if got, want := total.Get(fastsync.WrittenBytes), uint64(42); got != want {
 		t.Fatalf("total written bytes = %d, want %d", got, want)
 	}
-	if _, ok := <-collector.samples; ok {
-		t.Fatal("samples channel remains open after collector stop")
+	select {
+	case _, ok := <-collector.samples:
+		if !ok {
+			t.Fatal("dashboard closed before final log messages")
+		}
+	default:
 	}
+	close(collector.samples) // The dashboard owner closes it after logging final totals.
 }
 
 func TestDashboardLogWriterAcceptsConcurrentEvents(t *testing.T) {
@@ -114,5 +119,20 @@ func TestStatisticsShowBottleneck(t *testing.T) {
 	got := formatStats(stats{bottleneck: fastsync.BottleneckStatus{Label: "Server IO"}})
 	if !strings.Contains(got, "Bottleneck   Server IO") {
 		t.Fatalf("missing bottleneck: %s", got)
+	}
+}
+
+func TestDashboardCleanupPhases(t *testing.T) {
+	for phase, label := range map[int32]string{3: "LOADING INODE CACHE", 4: "FLUSHING DATA", 5: "SAVING RESUME CACHE", 6: "SHUTTING DOWN"} {
+		got := formatStats(stats{tuning: fastsync.TransferTuning{Phase: phase, PendingFlushFiles: 7, PendingFlushBytes: 1024}})
+		if !strings.Contains(got, label) {
+			t.Fatalf("phase %d missing: %s", phase, got)
+		}
+		if !strings.Contains(got, "Flush queue  7 files") {
+			t.Fatal("missing flush progress")
+		}
+		if phase == 3 && !strings.Contains(got, "Validated hints") {
+			t.Fatal("missing hydration progress")
+		}
 	}
 }

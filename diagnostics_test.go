@@ -56,7 +56,7 @@ func TestStatusRequiresHelloAndRoundTrips(t *testing.T) {
 	registry := rpc.NewServer()
 	registerTestRPCServer(t, registry, server)
 	client := newTestRPCClientForServer(t, registry)
-	if err := client.Call("Server.Hello", SharedOptions{ProtocolVersion: PROTOCOLVERSION}, nil); err != nil {
+	if err := NewClient().Handshake(client); err != nil {
 		t.Fatal(err)
 	}
 	server.localIO.Store(123456)

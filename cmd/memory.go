@@ -29,24 +29,36 @@ func processMemory() (uint64, error) {
 	return stats.Sys - stats.HeapReleased, nil
 }
 
-func startMemoryWatch(limit uint64) {
-	check := func() {
+func startMemoryWatch(limit uint64, graceful ...chan<- error) {
+	check := func() bool {
 		used, err := processMemory()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "memory guard:", err)
-			os.Exit(1)
+		if err == nil && used > limit {
+			err = fmt.Errorf("memory limit exceeded: %d > %d bytes; operation incomplete", used, limit)
 		}
-		if used > limit {
-			fmt.Fprintf(os.Stderr, "memory limit exceeded: %d > %d bytes; operation incomplete\n", used, limit)
-			os.Exit(1)
+		if err == nil {
+			return true
 		}
+		if len(graceful) > 0 {
+			select {
+			case graceful[0] <- err:
+			default:
+			}
+			return false
+		}
+		fmt.Fprintln(os.Stderr, "memory guard:", err)
+		os.Exit(1)
+		return false
 	}
-	check()
+	if !check() {
+		return
+	}
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for range ticker.C {
-			check()
+			if !check() {
+				return
+			}
 		}
 	}()
 }

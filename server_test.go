@@ -89,7 +89,7 @@ func TestServerRequiresHello(t *testing.T) {
 func TestServerHelloRejectsProtocolMismatch(t *testing.T) {
 	s := NewServer()
 
-	var reply any
+	var reply VersionInfo
 	err := s.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION + 1}, &reply)
 	if err == nil {
 		t.Fatal("Hello with protocol mismatch succeeded, want error")
@@ -104,8 +104,9 @@ func TestServerChunkErrorsAndClose(t *testing.T) {
 
 	s := NewServer()
 	s.BasePath = dir
-	var reply any
-	if err := s.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION}, &reply); err != nil {
+	var reply VersionInfo
+	authenticateTestSession(t, s)
+	if err := s.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION, BehaviorVersion: BEHAVIORVERSION}, &reply); err != nil {
 		t.Fatalf("hello: %v", err)
 	}
 

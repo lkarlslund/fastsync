@@ -8,10 +8,14 @@ import (
 	"github.com/klauspost/compress/s2"
 )
 
-const PROTOCOLVERSION = 1
+// Any protocol or transfer-behavior change requires a protocol bump (AGENTS.md).
+// Behavioral changes also bump BEHAVIORVERSION. Pure UI fixes need neither.
+const PROTOCOLVERSION = 4
+const BEHAVIORVERSION = 4
 
 type SharedOptions struct {
 	ProtocolVersion int
+	BehaviorVersion int
 	SendXattr       bool
 }
 
@@ -75,6 +79,8 @@ const (
 	QueueDispatches
 	ExistingExamined
 	ReuseGroups
+	BytesUniqueProcessed // regular-file bytes, once per successfully processed source inode
+	ResumeSubtreesSkipped
 	maxperformancecountertype
 )
 

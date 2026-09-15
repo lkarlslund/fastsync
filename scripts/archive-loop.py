@@ -86,6 +86,8 @@ def main():
         dest.mkdir(parents=True, exist_ok=True)
         common = [config["binary"], "", config["endpoint"], "--source", server,
                   "--directory", str(dest), "--ramlimit", str(config["ramlimit"])]
+        if config.get("password_file"):
+            common += ["--password-file", config["password_file"]]
         status = dict(identity=expected, attempt=attempt, report=str(report))
         for phase in ("copying", "verifying"):
             status.update(phase=phase, updated=time.time())
@@ -97,6 +99,11 @@ def main():
                 args[1] = "client"
                 args += ["--hardlinks", "--xattr", "--pfile", "64", "--pdir", "8",
                          "--queuesize", "1024", "--blocksize", str(config.get("blocksize",65536))]
+                if config.get("resume_cache", False):
+                    args += ["--resume-cache", str(directory / "reuse-hints.jsonl"),
+                             "--resume-id", str(config["snapshot_guid"])]
+                    if config.get("resume_position", False):
+                        args += ["--resume-position"]
                 args += config.get("client_args", [])
             else:
                 args[1] = "verify"

@@ -180,6 +180,12 @@ func (m *fileFlusher) finish() error {
 }
 func (c *Client) finishDataFile(file *os.File) {
 	if c.flusher != nil {
+		if c.resume != nil {
+			if _, err := c.flusher.get(file); err != nil {
+				c.recordError("register checkpoint file flush: %v", err)
+				return
+			}
+		}
 		c.flusher.finishFile(file)
 	}
 }

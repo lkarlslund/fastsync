@@ -44,6 +44,10 @@ func (c *Client) walkAlphabetical(client *rpc.Client, root FileInfo) {
 			continue
 		}
 		c.directoryPending.Add(-1)
+		if c.skipResumeDirectory(item) {
+			c.ProcessedItemInDir(filepath.Dir(item.Name))
+			continue
+		}
 		if c.warming {
 			local, err := c.localFileInfo(filepath.Join(c.BasePath, item.Name))
 			if os.IsNotExist(err) {
@@ -111,6 +115,11 @@ func (c *Client) walkAlphabetical(client *rpc.Client, root FileInfo) {
 		// Prefetch in name order, but never enqueue files from these responses here.
 		for _, e := range entries {
 			if e.IsDir && len(futures) < c.ParallelDir {
+				if c.ResumePosition && c.resume != nil {
+					if _, ok := c.resume.subtrees[relativeResumePath(e.Name)]; ok {
+						continue
+					}
+				}
 				future := make(chan directoryListing, 1)
 				futures[e.Name] = future
 				go func(item FileInfo) { future <- fetch(item) }(e)

@@ -116,10 +116,13 @@ func TestServerRejectsSymlinkContentAndDirectoryRPCs(t *testing.T) {
 	}
 	s := NewServer()
 	s.BasePath = root
-	if err := s.NewSession().SelectRoot("alias", nil); err == nil {
+	selectedSession := s.NewSession()
+	authenticateTestSession(t, selectedSession)
+	if err := selectedSession.SelectRoot("alias", nil); err == nil {
 		t.Fatal("selected symlink root inside share")
 	}
-	if err := s.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION}, nil); err != nil {
+	authenticateTestSession(t, s)
+	if err := s.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION, BehaviorVersion: BEHAVIORVERSION}, nil); err != nil {
 		t.Fatal(err)
 	}
 	var list FileListResponse

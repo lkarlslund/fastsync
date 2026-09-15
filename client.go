@@ -15,6 +15,7 @@ type inodeKey struct {
 }
 
 type inodeinfo struct {
+	bytesCounted      bool // owned by the scheduler dispatcher; warmup never counts bytes
 	seed              *reuseSeed
 	seedOnce          sync.Once
 	seedErr           error
@@ -32,11 +33,16 @@ type dirinfo struct {
 }
 
 type Client struct {
-	reuseLocks [256]sync.Mutex
-	warming    bool // changed only between joined passes
-	phase      atomic.Int32
-	BasePath   string
-	SourcePath string
+	ResumeCache, ResumeIdentity string
+	ResumePosition              bool
+	resume                      *resumeCache
+	Password                    string // Local only; never serialized or logged.
+	reuseLocks                  [256]sync.Mutex
+	warming                     bool // changed only between joined passes
+	phase                       atomic.Int32
+	shutdownRequested           atomic.Bool
+	BasePath                    string
+	SourcePath                  string
 
 	FlushInterval       time.Duration
 	writtenTotal        atomic.Uint64
@@ -108,6 +114,7 @@ func NewClient() *Client {
 		BlockSize:         16 * 1024,
 		Options: SharedOptions{
 			ProtocolVersion: PROTOCOLVERSION,
+			BehaviorVersion: BEHAVIORVERSION,
 		},
 		inodes:   make(map[inodeKey]*inodeinfo),
 		dircache: make(map[string]*dirinfo),
@@ -153,7 +160,12 @@ func (c *Client) Run(client *rpc.Client) (runErr error) {
 	if err != nil {
 		return err
 	}
-	defer func() { runErr = errors.Join(runErr, stopTuning()) }()
+	defer func() {
+		c.phase.Store(4)
+		Logger.Info().Msg("Flushing remaining file data; waiting for pending writes")
+		runErr = errors.Join(runErr, stopTuning())
+		Logger.Info().Msg("File data flush finished")
+	}()
 
 	stopDiagnostics := c.startDiagnostics(client)
 	defer stopDiagnostics()
@@ -171,12 +183,28 @@ func (c *Client) Run(client *rpc.Client) (runErr error) {
 	if st, err := lstatNoFollow(c.BasePath); err != nil || !st.IsDir() {
 		return fmt.Errorf("destination must be an existing directory: %s", c.BasePath)
 	}
-	if c.PreserveHardlinks {
+	cache, loaded, cacheErr := c.openResumeCache(rootdirinfo)
+	if cacheErr != nil {
+		return cacheErr
+	}
+	if cache != nil {
+		defer func() {
+			c.phase.Store(5)
+			Logger.Info().Msg("Saving and flushing resume cache")
+			cache.Close()
+			c.resume = nil
+			Logger.Info().Msg("Resume cache saved")
+		}()
+	}
+	if c.PreserveHardlinks && !loaded {
 		c.phase.Store(1)
 		c.warming = true
 		Logger.Info().Msg("Pass 1: checking existing paths and warming hardlink cache")
 		c.warmExistingPass(client, rootdirinfo)
 		c.warming = false
+		if cache != nil {
+			cache.publish(c.runError() == nil)
+		}
 		// Warmup failures remain in the final error state, but must not prevent
 		// the second walk from copying accessible paths or retrying a listing.
 		if err := c.runError(); err != nil {
@@ -282,6 +310,7 @@ func (c *Client) PostProcessDir(item *dirinfo) {
 			c.recordError("Problem applying directory metadata for %v: %v", filepath.Join(c.BasePath, item.name), err)
 		}
 	}
+	c.checkpointResumeDirectory(item)
 }
 
 func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
@@ -318,11 +347,7 @@ func (c *Client) runError() error {
 	return fmt.Errorf("sync failed with %d error(s); first: %w", c.errorCount, c.firstError)
 }
 
-func (c *Client) hello(client *rpc.Client) error {
-	if c.SourcePath != "" {
-		if err := client.Call("Server.SelectRoot", c.SourcePath, nil); err != nil {
-			return fmt.Errorf("select source %q: %w", c.SourcePath, err)
-		}
-	}
-	return client.Call("Server.Hello", &c.Options, nil)
-}
+func (c *Client) hello(client *rpc.Client) error { return c.Handshake(client) }
+
+// NotifyShutdown updates local presentation while Run finishes cleanup.
+func (c *Client) NotifyShutdown() { c.shutdownRequested.Store(true) }

@@ -131,8 +131,8 @@ claim the group. Fixed striped locks ensure a checksum is not repeated for every
 alias after one member qualifies. Single-link files are handled in pass 2.
 
 Only the in-memory inode cache survives the barrier, one path per reusable source
-inode plus validation metadata; no missing-file inventory or persistent index is
-created. Candidate eligibility and destination inode ownership checks prevent
+inode plus validation metadata; no missing-file inventory is created. An optional
+persistent resume cache saves validated reuse hints (see resume-cache.md). Candidate eligibility and destination inode ownership checks prevent
 merging distinct source inodes. Cached members are revalidated before first use.
 Source mutation/replaced cached destination errors fail the run.
 

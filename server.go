@@ -29,10 +29,13 @@ func NewServer() *Server {
 }
 
 type Server struct {
-	BasePath string
-	AutoTune bool
-	readGate *ioGate
-	tuning   *tuningCoordinator
+	passwordKey                  []byte
+	authNonce                    []byte
+	authAttempted, authenticated bool
+	BasePath                     string
+	AutoTune                     bool
+	readGate                     *ioGate
+	tuning                       *tuningCoordinator
 
 	metadataGate *ioGate
 
@@ -74,6 +77,9 @@ func (s *Server) SelectRoot(path string, reply *any) error {
 	if s.clientsaidhello.Load() {
 		return ErrPleaseSayHelloOnce
 	}
+	if !s.authenticated {
+		return ErrAuthentication
+	}
 	if !filepath.IsLocal(path) {
 		return ErrInvalidPath
 	}
@@ -100,16 +106,23 @@ func (s *Server) SelectRoot(path string, reply *any) error {
 	return nil
 }
 
-func (s *Server) Hello(options SharedOptions, reply *any) error {
+func (s *Server) Hello(options SharedOptions, reply *VersionInfo) error {
 	s.helloMu.Lock()
 	defer s.helloMu.Unlock()
 	if s.clientsaidhello.Load() {
 		return ErrPleaseSayHelloOnce
 	}
 
-	if options.ProtocolVersion != PROTOCOLVERSION {
-		return fmt.Errorf("Server expects protocol version %v, but client is running %v, please use same binary version for transfers", PROTOCOLVERSION, options.ProtocolVersion)
+	if !s.authenticated {
+		return ErrAuthentication
 	}
+	if err := (VersionInfo{options.ProtocolVersion, options.BehaviorVersion}).check(); err != nil {
+		return err
+	}
+	if reply != nil {
+		*reply = CurrentVersions()
+	}
+
 	s.Options = options
 	s.clientsaidhello.Store(true)
 	return nil
@@ -347,6 +360,7 @@ func (s *Server) Hash(path string, reply *string) error {
 // Each connection owns its handles and negotiated options.
 func (s *Server) NewSession() *Server {
 	session := NewServer()
+	session.passwordKey = append([]byte(nil), s.passwordKey...)
 	session.metadataGate = s.metadataGate
 	session.AutoTune, session.readGate, session.tuning = s.AutoTune, s.readGate, s.tuning
 	session.BasePath, session.Perf, session.shutdown = s.BasePath, s.Perf, s.shutdown

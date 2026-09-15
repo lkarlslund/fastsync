@@ -164,7 +164,8 @@ func TestTuningPhasesDoNotChangeBothSides(t *testing.T) {
 	if err := s.ConfigureIO(32, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION}, nil); err != nil {
+	authenticateTestSession(t, s)
+	if err := s.Hello(SharedOptions{ProtocolVersion: PROTOCOLVERSION, BehaviorVersion: BEHAVIORVERSION}, nil); err != nil {
 		t.Fatal(err)
 	}
 	for phase := 0; phase < 6; phase++ {
