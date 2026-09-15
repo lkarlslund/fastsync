@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -144,26 +145,39 @@ func (c *Client) openResumeCache(root FileInfo) (*resumeCache, bool, error) {
 func (c *Client) loadResumeHints(r *resumeCache) bool {
 	file, err := openNoFollow(r.path)
 	if os.IsNotExist(err) {
+		Logger.Info().Msg("Resume cache not found; scanning existing paths")
 		return false
 	}
 	if err != nil {
-		Logger.Warn().Msg("Resume cache unavailable; scanning existing paths")
+		Logger.Warn().Err(err).Msg("Resume cache unavailable; scanning existing paths")
 		return false
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	if !scanner.Scan() {
+		Logger.Warn().Err(scanner.Err()).Msg("Resume cache header missing or unreadable; scanning existing paths")
 		return false
 	}
 	var header resumeRecord
 	if json.Unmarshal(scanner.Bytes(), &header) != nil || header.Identity == nil {
+		Logger.Warn().Msg("Resume cache header invalid; scanning existing paths")
 		return false
 	}
 	before, _ := json.Marshal(header.Identity)
 	now, _ := json.Marshal(r.identity)
 	if string(before) != string(now) {
-		Logger.Info().Msg("Resume cache identity changed; scanning existing paths")
+		var previous, current map[string]json.RawMessage
+		_ = json.Unmarshal(before, &previous)
+		_ = json.Unmarshal(now, &current)
+		var changed []string
+		for key, value := range current {
+			if string(previous[key]) != string(value) {
+				changed = append(changed, key)
+			}
+		}
+		sort.Strings(changed)
+		Logger.Info().Strs("changed_fields", changed).Msg("Resume cache identity changed; scanning existing paths")
 		return false
 	}
 	// Bound validation work, including RPCs; don't load a second full hint list.
@@ -171,6 +185,18 @@ func (c *Client) loadResumeHints(r *resumeCache) bool {
 	var workers sync.WaitGroup
 	var validationMu sync.Mutex
 	valid := true
+	failures := make(map[string]int)
+	validated := 0
+	reject := func(reason, path string, err error) {
+		validationMu.Lock()
+		defer validationMu.Unlock()
+		valid = false
+		failures[reason]++
+		// One example per reason keeps large stale caches from flooding the log.
+		if failures[reason] == 1 {
+			Logger.Warn().Str("reason", reason).Str("path", path).Err(err).Msg("Resume cache validation failed (first example)")
+		}
+	}
 	for i := 0; i < c.ParallelFile; i++ {
 		workers.Add(1)
 		go func() {
@@ -178,18 +204,25 @@ func (c *Client) loadResumeHints(r *resumeCache) bool {
 			for hint := range jobs {
 				var remote FileInfo
 				err := c.remoteClient.Call("Server.Stat", hint.Path, &remote)
+				reason := "source_stat_error"
 				if err == nil && (remote.Dev != hint.Dev || remote.Inode != hint.Inode || remote.Nlink <= 1) {
-					err = fmt.Errorf("stale hint")
+					reason = "source_inode_or_link_count_changed"
+					err = fmt.Errorf("expected device/inode %d/%d, got %d/%d with %d links", hint.Dev, hint.Inode, remote.Dev, remote.Inode, remote.Nlink)
 				}
 				if err == nil {
+					reason = "destination_validation_error"
 					err = c.warmExistingFile(c.remoteClient, remote)
 				}
 				c.inodesMu.Lock()
 				present := c.inodes[inodeKey{hint.Dev, hint.Inode}] != nil
 				c.inodesMu.Unlock()
-				if err != nil || !present {
+				if err != nil {
+					reject(reason, hint.Path, err)
+				} else if !present {
+					reject("destination_not_reusable", hint.Path, nil)
+				} else {
 					validationMu.Lock()
-					valid = false
+					validated++
 					validationMu.Unlock()
 				}
 				c.Perf.Add(ExistingExamined, 1)
@@ -197,20 +230,18 @@ func (c *Client) loadResumeHints(r *resumeCache) bool {
 		}()
 	}
 	complete := false
+	line := 1
 	for scanner.Scan() {
+		line++
 		var record resumeRecord
-		if json.Unmarshal(scanner.Bytes(), &record) != nil {
-			validationMu.Lock()
-			valid = false
-			validationMu.Unlock()
+		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+			reject("malformed_record", fmt.Sprintf("journal line %d", line), err)
 			break
 		}
 		if record.Subtree != nil && record.Hint == nil && record.Identity == nil && !record.Complete {
 			name := relativeResumePath(record.Subtree.Source.Name)
 			if !filepath.IsLocal(name) || filepath.Dir(name) != "." {
-				validationMu.Lock()
-				valid = false
-				validationMu.Unlock()
+				reject("invalid_subtree_record", fmt.Sprintf("journal line %d", line), nil)
 				break
 			}
 			r.subtrees[name] = *record.Subtree
@@ -221,9 +252,7 @@ func (c *Client) loadResumeHints(r *resumeCache) bool {
 			continue
 		}
 		if record.Hint == nil || record.Identity != nil || record.Complete || record.Subtree != nil || !filepath.IsLocal(record.Hint.Path) {
-			validationMu.Lock()
-			valid = false
-			validationMu.Unlock()
+			reject("invalid_hint_record", fmt.Sprintf("journal line %d", line), nil)
 			break
 		}
 		jobs <- *record.Hint
@@ -231,8 +260,12 @@ func (c *Client) loadResumeHints(r *resumeCache) bool {
 	close(jobs)
 	workers.Wait()
 	if scanner.Err() != nil {
-		valid = false
+		reject("journal_read_error", fmt.Sprintf("after journal line %d", line), scanner.Err())
 	}
+	if !complete {
+		reject("completion_marker_missing", "", nil)
+	}
+	Logger.Info().Int("validated_hints", validated).Interface("failure_counts", failures).Bool("completion_marker", complete).Msg("Resume cache validation summary")
 	if !valid || !complete {
 		r.subtrees = make(map[string]resumeSubtree)
 		Logger.Info().Msg("Resume cache incomplete or stale; scanning existing paths")

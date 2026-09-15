@@ -1,6 +1,9 @@
 package fastsync
 
 import (
+	"bytes"
+	"encoding/json"
+	"github.com/rs/zerolog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,5 +122,38 @@ func TestPersistentCacheClosePublishesPartialHints(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "b/file") || strings.Contains(string(data), `"Complete":true`) {
 		t.Fatal("partial cache was not saved correctly")
+	}
+}
+
+func TestResumeCacheFallbackExplainsJournalFailure(t *testing.T) {
+	for _, tc := range []struct{ name, tail, reason string }{
+		{"missing completion", "", "completion_marker_missing"},
+		{"malformed", "{broken\n", "malformed_record"},
+		{"invalid hint", "{\"Hint\":{\"Path\":\"../escape\"}}\n", "invalid_hint_record"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			old := Logger
+			Logger = zerolog.New(&logs)
+			defer func() { Logger = old }()
+			r := &resumeCache{path: filepath.Join(t.TempDir(), "cache.jsonl")}
+			header, err := json.Marshal(resumeRecord{Identity: &r.identity})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(r.path, append(append(header, '\n'), []byte(tc.tail)...), 0600); err != nil {
+				t.Fatal(err)
+			}
+			c := NewClient()
+			c.ParallelFile = 1
+			if c.loadResumeHints(r) {
+				t.Fatal("invalid cache accepted")
+			}
+			for _, want := range []string{tc.reason, "failure_counts", "validated_hints", "completion_marker"} {
+				if !strings.Contains(logs.String(), want) {
+					t.Fatalf("missing %q in %s", want, logs.String())
+				}
+			}
+		})
 	}
 }
