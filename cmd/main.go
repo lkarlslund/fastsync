@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -71,12 +72,15 @@ func main() {
 				fastsync.Logger.Fatal().Msgf("Invalid log level: %v", loglevel)
 			}
 			configureConsoleLogger(zll, !term.IsTerminal(int(os.Stderr.Fd())))
+			if ramlimit > 0 {
+				startMemoryWatch(ramlimit)
+			}
 
 			// CPU profiling setup
 			if cpuprofile == "auto" {
 				go autoProfile()
 			} else if cpuprofile != "" {
-				f, err := os.Create(cpuprofile)
+				f, err := fastsync.OpenFileNoFollow(cpuprofile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 				if err != nil {
 					log.Fatal(err)
 				}
@@ -114,20 +118,24 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&loglevel, "loglevel", "info", "Log level")
 	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "Write cpu profile to file (filename, use 'auto' to trigger auto profiling)")
 	rootCmd.PersistentFlags().IntVar(&cpuprofilelength, "cpuprofilelength", 0, "Stop profiling after N seconds, 0 to profile until program terminates")
-	rootCmd.PersistentFlags().Uint64Var(&ramlimit, "ramlimit", 0, "Abort if process uses more than this amount bytes of RAM")
+	rootCmd.PersistentFlags().Uint64Var(&ramlimit, "ramlimit", 0, "Abort with nonzero exit when sampled process memory exceeds this many bytes (0 disables)")
 
 	// Server command
 	var bind string
+	var serverMetadata int
+	var serverReads int
+	var serverAuto bool
 	var serverCmd = &cobra.Command{
 		Use:   "server",
 		Short: "Run as server",
 		Run: func(cmd *cobra.Command, args []string) {
-			rpcserver := rpc.NewServer()
 			fastsyncserver := fastsync.NewServer()
 			fastsyncserver.BasePath = directory
-			err := rpcserver.Register(fastsyncserver)
-			if err != nil {
-				fastsync.Logger.Fatal().Msgf("Error registering server object: %v", err)
+			if err := fastsyncserver.ConfigureMetadata(serverMetadata); err != nil {
+				fastsync.Logger.Fatal().Err(err).Msg("Invalid metadata limit")
+			}
+			if err := fastsyncserver.ConfigureIO(serverReads, serverAuto); err != nil {
+				fastsync.Logger.Fatal().Err(err).Msg("Invalid source IO limits")
 			}
 
 			listener, err := net.Listen("tcp", bind)
@@ -140,13 +148,20 @@ func main() {
 					conn, err := listener.Accept()
 					if err != nil {
 						fastsync.Logger.Error().Msgf("Error accepting connection: %v", err)
-						continue
+						return
 					}
 					fastsync.Logger.Info().Msgf("Accepted connection from %v", conn.RemoteAddr())
 					wconn := fastsync.NewPerformanceWrapper(conn, fastsyncserver.Perf.GetAtomicAdder(fastsync.RecievedOverWire), fastsyncserver.Perf.GetAtomicAdder(fastsync.SentOverWire))
 					cconn := fastsync.CompressedReadWriteCloser(wconn)
 					wcconn := fastsync.NewPerformanceWrapper(cconn, fastsyncserver.Perf.GetAtomicAdder(fastsync.RecievedBytes), fastsyncserver.Perf.GetAtomicAdder(fastsync.SentBytes))
 					go func() {
+						session := fastsyncserver.NewSession()
+						defer session.CloseFiles()
+						rpcserver := rpc.NewServer()
+						if err := rpcserver.Register(session); err != nil {
+							_ = conn.Close()
+							return
+						}
 						var h codec.MsgpackHandle
 						rpcserver.ServeCodec(codec.GoRpc.ServerCodec(wcconn, &h))
 						fastsync.Logger.Info().Msgf("Closed connection from %v", conn.RemoteAddr())
@@ -154,8 +169,12 @@ func main() {
 				}
 			}()
 			fastsyncserver.Wait()
+			_ = listener.Close()
 		},
 	}
+	serverCmd.Flags().IntVar(&serverMetadata, "metadata-parallel", 8, "Maximum source metadata operations across all clients")
+	serverCmd.Flags().IntVar(&serverReads, "read-parallel", 64, "Maximum concurrent source reads across all clients")
+	serverCmd.Flags().BoolVar(&serverAuto, "autotune", false, "Adapt source read concurrency when driven by an autotuning client")
 	serverCmd.Flags().StringVar(&bind, "bind", "0.0.0.0:7331", "Address to bind to")
 
 	// Client command
@@ -164,15 +183,25 @@ func main() {
 		xattr             bool
 		checksum          bool
 		deleteOpt         bool
+		durable           bool
 		parallelfile      int
 		paralleldir       int
 		queuesize         int
 		transferblocksize int
 	)
+	var sourcePath string
+	var pipeline, autoTune bool
+	var flushInterval time.Duration
+	var flushBytes int64
+	var flushFiles, flushWorkers int
+	var metadataParallel int
+	var writeParallel, cachedFiles int
+	var bufferBytes int64
 	var clientCmd = &cobra.Command{
-		Use:   "client",
-		Short: "Run as client",
-		Run: func(cmd *cobra.Command, args []string) {
+		SilenceUsage: true,
+		Use:          "client",
+		Short:        "Run as client",
+		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
 				fastsync.Logger.Fatal().Msgf("Please provide server address and port to connect to")
 			}
@@ -184,6 +213,17 @@ func main() {
 
 			c := fastsync.NewClient()
 			c.BasePath = directory
+			c.Pipeline = pipeline || autoTune
+			c.AutoTune = autoTune
+			c.FlushInterval = flushInterval
+			c.FlushBytes = flushBytes
+			c.FlushFiles = flushFiles
+			c.FlushWorkers = flushWorkers
+			c.WriteParallel = writeParallel
+			c.MetadataParallel = metadataParallel
+			c.CachedFiles = cachedFiles
+			c.BufferBytes = bufferBytes
+			c.SourcePath = sourcePath
 			c.PreserveHardlinks = hardlinks
 			c.ParallelDir = paralleldir
 			c.ParallelFile = parallelfile
@@ -192,7 +232,11 @@ func main() {
 			c.AlwaysChecksum = checksum
 			c.Options.SendXattr = xattr
 			c.Delete = deleteOpt
+			c.Durable = durable
 
+			sourceLabel := strings.TrimSuffix(serveraddr, "/") + "/" + strings.TrimPrefix(c.SourcePath, "/")
+			copyMessage := fmt.Sprintf("Copying from %s to %s", sourceLabel, c.BasePath)
+			fastsync.Logger.Info().Msg(copyMessage)
 			conn, err := net.Dial("tcp", serveraddr)
 			if err != nil {
 				fastsync.Logger.Fatal().Msgf("Error connecting to %s: %v", serveraddr, err)
@@ -227,6 +271,7 @@ func main() {
 					tuiDone = nil
 				} else {
 					fastsync.Logger = zerolog.New(dashboard.logWriter).With().Timestamp().Logger().Level(clientLogLevel)
+					fastsync.Logger.Info().Msg(copyMessage)
 					interrupted = dashboard.interrupted
 					dashboardActive = true
 				}
@@ -243,7 +288,7 @@ func main() {
 				case <-interrupted:
 					rpcClosed = true
 					_ = rpcClient.Close()
-					err = <-syncDone
+					err = errors.Join(<-syncDone, errors.New("transfer interrupted"))
 				}
 			} else {
 				err = c.Run(rpcClient)
@@ -253,9 +298,7 @@ func main() {
 			}
 
 			if !rpcClosed {
-				if err := rpcClient.Close(); err != nil {
-					fastsync.Logger.Error().Msgf("Error closing RPC client: %v", err)
-				}
+				err = errors.Join(err, rpcClient.Close())
 			}
 
 			totalhistory := collector.Stop()
@@ -270,23 +313,36 @@ func main() {
 			}
 
 			fastsync.Logger.Warn().Msgf("Final statistics")
-			fastsync.Logger.Warn().Msgf("Wired %v, transferred %v, local read/write %v processed %v - %v files - %v dirs",
+			fastsync.Logger.Warn().Msgf("Wired %v, transferred %v, local read/write %v - %v files - %v dirs",
 				humanize.Bytes(totalhistory.Get(fastsync.SentOverWire)+totalhistory.Get(fastsync.RecievedOverWire)),
 				humanize.Bytes(totalhistory.Get(fastsync.SentBytes)+totalhistory.Get(fastsync.RecievedBytes)),
 				humanize.Bytes(totalhistory.Get(fastsync.ReadBytes)+totalhistory.Get(fastsync.WrittenBytes)),
-				humanize.Bytes(totalhistory.Get(fastsync.BytesProcessed)),
 				totalhistory.Get(fastsync.FilesProcessed),
 				totalhistory.Get(fastsync.DirectoriesProcessed))
+			fastsync.Logger.Warn().Msgf("Existing pass: examined %d paths, found %d reusable inode groups", totalhistory.Get(fastsync.ExistingExamined), totalhistory.Get(fastsync.ReuseGroups))
 			fastsync.Logger.Warn().Msgf("Deleted %v", totalhistory.Get(fastsync.EntriesDeleted))
+			return err
 		},
 	}
+	clientCmd.Flags().Int64Var(&flushBytes, "flush-bytes", 256<<20, "Maximum written bytes awaiting file flush")
+	clientCmd.Flags().IntVar(&flushFiles, "flush-files", 64, "Maximum files awaiting flush, including open files")
+	clientCmd.Flags().IntVar(&flushWorkers, "flush-workers", 64, "Maximum background file-flush workers (share destination IO limit)")
+	clientCmd.Flags().DurationVar(&flushInterval, "flush-interval", 30*time.Second, "Age interval for background file flushes (0 disables; also flushes completed files and batches at byte limits)")
+	clientCmd.Flags().BoolVar(&pipeline, "pipeline", false, "Use bounded read-ahead and independent destination writers")
+	clientCmd.Flags().BoolVar(&autoTune, "autotune", false, "Adapt source reads and destination writes (enables pipeline)")
+	clientCmd.Flags().IntVar(&metadataParallel, "metadata-parallel", 8, "Maximum concurrent destination stat, metadata update and publication operations in pipeline mode")
+	clientCmd.Flags().IntVar(&writeParallel, "write-parallel", 64, "Maximum active destination data files/write operations")
+	clientCmd.Flags().IntVar(&cachedFiles, "cached-files", 64, "Maximum admitted streaming files, including files awaiting writes")
+	clientCmd.Flags().Int64Var(&bufferBytes, "buffer-bytes", 128*1024*1024, "Payload buffer reservation budget; excludes kernel cache and other process memory")
+	clientCmd.Flags().StringVar(&sourcePath, "source", "", "Subdirectory of the remote server root")
+	clientCmd.Flags().BoolVar(&durable, "durable", false, "Flush each copied file and parent directory to stable storage (slower)")
 	clientCmd.Flags().BoolVar(&hardlinks, "hardlinks", true, "Preserve hardlinks")
 	clientCmd.Flags().BoolVar(&xattr, "xattr", true, "Transfer xattrs")
 	clientCmd.Flags().BoolVar(&checksum, "checksum", false, "Checksum files")
 	clientCmd.Flags().BoolVar(&deleteOpt, "delete", false, "Delete extra local files (mirror)")
-	clientCmd.Flags().IntVar(&parallelfile, "pfile", 4096, "Number of parallel file IO operations")
-	clientCmd.Flags().IntVar(&paralleldir, "pdir", 512, "Number of parallel dir scanning operations")
-	clientCmd.Flags().IntVar(&queuesize, "queuesize", 65536, "Incoming block queue size")
+	clientCmd.Flags().IntVar(&parallelfile, "pfile", 64, "Number of parallel file IO operations")
+	clientCmd.Flags().IntVar(&paralleldir, "pdir", 8, "Maximum concurrent directory listing requests (alphabetical traversal)")
+	clientCmd.Flags().IntVar(&queuesize, "queuesize", 1024, "Incoming block queue size")
 	clientCmd.Flags().IntVar(&transferblocksize, "blocksize", 64*1024, "Transfer/checksum block size")
 
 	// Shutdown command
@@ -325,7 +381,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(serverCmd, clientCmd, shutdownCmd)
+	rootCmd.AddCommand(serverCmd, clientCmd, shutdownCmd, newVerifyCommand())
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -363,7 +419,7 @@ func autoProfile() {
 			autoprofiling = true
 			highmarks = 0
 			fastsync.Logger.Warn().Msg("CPU high, auto profiling starting")
-			f, err := os.Create(fmt.Sprintf("cpu-autoprofile-%v.prof", time.Now()))
+			f, err := fastsync.OpenFileNoFollow(fmt.Sprintf("cpu-autoprofile-%v.prof", time.Now()), os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0666)
 			if err != nil {
 				log.Fatal(err)
 			}

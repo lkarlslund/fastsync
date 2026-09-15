@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -28,17 +30,26 @@ func NewServer() *Server {
 
 type Server struct {
 	BasePath string
+	AutoTune bool
+	readGate *ioGate
+	tuning   *tuningCoordinator
+
+	metadataGate *ioGate
 
 	Options SharedOptions
 
 	ReadOnly bool
 
-	clientsaidhello bool
+	clientsaidhello atomic.Bool
+	helloMu         sync.Mutex
 	shutdown        chan struct{}
 	filesMu         sync.Mutex
 	files           map[string]*os.File
 
-	Perf *performance
+	host     hostSampler
+	localIO  atomic.Uint64
+	activeIO atomic.Int64
+	Perf     *performance
 }
 
 func (s *Server) localPath(path string) (string, error) {
@@ -56,20 +67,56 @@ func (s *Server) localPath(path string) (string, error) {
 	return filepath.Join(s.BasePath, rel), nil
 }
 
+// SelectRoot scopes this connection before Hello. Older servers reject this RPC.
+func (s *Server) SelectRoot(path string, reply *any) error {
+	s.helloMu.Lock()
+	defer s.helloMu.Unlock()
+	if s.clientsaidhello.Load() {
+		return ErrPleaseSayHelloOnce
+	}
+	if !filepath.IsLocal(path) {
+		return ErrInvalidPath
+	}
+	base, err := DirectoryPathNoFollow(s.BasePath)
+	if err != nil {
+		return err
+	}
+	selected, err := DirectoryPathNoFollow(filepath.Join(base, path))
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(base, selected)
+	if err != nil || !filepath.IsLocal(rel) {
+		return ErrInvalidPath
+	}
+	info, err := lstatNoFollow(selected)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("selected source is not a directory")
+	}
+	s.BasePath = selected
+	return nil
+}
+
 func (s *Server) Hello(options SharedOptions, reply *any) error {
-	//	if s.clientsaidhello {
-	//		return ErrPleaseSayHelloOnce
-	//	}
+	s.helloMu.Lock()
+	defer s.helloMu.Unlock()
+	if s.clientsaidhello.Load() {
+		return ErrPleaseSayHelloOnce
+	}
+
 	if options.ProtocolVersion != PROTOCOLVERSION {
 		return fmt.Errorf("Server expects protocol version %v, but client is running %v, please use same binary version for transfers", PROTOCOLVERSION, options.ProtocolVersion)
 	}
 	s.Options = options
-	s.clientsaidhello = true
+	s.clientsaidhello.Store(true)
 	return nil
 }
 
 func (s *Server) Shutdown(input any, reply *any) error {
-	if !s.clientsaidhello {
+	if !s.clientsaidhello.Load() {
 		return ErrPleaseSayHello
 	}
 	Logger.Info().Msg("Shutting down server")
@@ -81,7 +128,13 @@ func (s *Server) Shutdown(input any, reply *any) error {
 }
 
 func (s *Server) List(path string, reply *FileListResponse) error {
-	if !s.clientsaidhello {
+	if s.metadataGate != nil {
+		release := s.metadataGate.acquire()
+		defer release(0, 0)
+	}
+
+	defer s.trackIO()()
+	if !s.clientsaidhello.Load() {
 		return ErrPleaseSayHello
 	}
 	Logger.Trace().Msgf("Listing files in %s", path)
@@ -93,18 +146,14 @@ func (s *Server) List(path string, reply *FileListResponse) error {
 	if err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(localpath)
+	entries, err := readDirNoFollow(localpath)
 	if err != nil {
 		return err
 	}
 	for _, d := range entries {
 		absolutepath := filepath.Join(localpath, d.Name())
 		relativepath := filepath.Join(path, d.Name())
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		fi, err := InfoToFileInfo(info, absolutepath)
+		fi, err := pathToFileInfo(absolutepath, s.Options.SendXattr)
 		if err != nil {
 			return err
 		}
@@ -120,7 +169,13 @@ func (s *Server) List(path string, reply *FileListResponse) error {
 }
 
 func (s *Server) Stat(path string, reply *FileInfo) error {
-	if !s.clientsaidhello {
+	if s.metadataGate != nil {
+		release := s.metadataGate.acquire()
+		defer release(0, 0)
+	}
+
+	defer s.trackIO()()
+	if !s.clientsaidhello.Load() {
 		return ErrPleaseSayHello
 	}
 	Logger.Trace().Msgf("Stat entry %s", path)
@@ -131,11 +186,11 @@ func (s *Server) Stat(path string, reply *FileInfo) error {
 	}
 	relativepath := path
 
-	info, err := os.Lstat(absolutepath)
+	info, err := lstatNoFollow(absolutepath)
 	if err != nil {
 		return err
 	}
-	fi, err := InfoToFileInfo(info, absolutepath)
+	fi, err := infoToFileInfo(info, absolutepath, s.Options.SendXattr)
 	// Override path to only send the relative path
 	fi.Name = relativepath
 	*reply = fi
@@ -143,7 +198,13 @@ func (s *Server) Stat(path string, reply *FileInfo) error {
 }
 
 func (s *Server) Open(path string, reply *interface{}) error {
-	if !s.clientsaidhello {
+	if s.metadataGate != nil {
+		release := s.metadataGate.acquire()
+		defer release(0, 0)
+	}
+
+	defer s.trackIO()()
+	if !s.clientsaidhello.Load() {
 		return ErrPleaseSayHello
 	}
 	Logger.Trace().Msgf("Opening file %s", path)
@@ -151,7 +212,7 @@ func (s *Server) Open(path string, reply *interface{}) error {
 	if err != nil {
 		return err
 	}
-	h, err := os.Open(localpath)
+	h, err := openNoFollow(localpath)
 	if err != nil {
 		return err
 	}
@@ -169,9 +230,15 @@ func (s *Server) Open(path string, reply *interface{}) error {
 }
 
 func (s *Server) GetChunk(args GetChunkArgs, data *[]byte) error {
-	if !s.clientsaidhello {
+	if !s.clientsaidhello.Load() {
 		return ErrPleaseSayHello
 	}
+	if s.readGate != nil {
+		release := s.readGate.acquire()
+		started := time.Now()
+		defer func() { release(args.Size, time.Since(started)) }()
+	}
+
 	Logger.Trace().Msgf("Getting chunk from file %s at offset %d size %d", args.Path, args.Offset, args.Size)
 	s.filesMu.Lock()
 	fh, found := s.files[args.Path]
@@ -179,11 +246,12 @@ func (s *Server) GetChunk(args GetChunkArgs, data *[]byte) error {
 	if !found {
 		return errors.New("file handle not found")
 	}
-	if args.Size > uint64(int(^uint(0)>>1)) {
+	if args.Size > 16*1024*1024 || args.Offset > (1<<63-1)-args.Size {
 		return fmt.Errorf("chunk size too large: %d", args.Size)
 	}
 	d := make([]byte, int(args.Size))
-	n, err := fh.ReadAt(d, int64(args.Offset))
+	var n int
+	err := timedIO(&s.localIO, &s.activeIO, func() error { var e error; n, e = fh.ReadAt(d, int64(args.Offset)); return e })
 	if err != nil {
 		return err
 	}
@@ -195,9 +263,15 @@ func (s *Server) GetChunk(args GetChunkArgs, data *[]byte) error {
 }
 
 func (s *Server) ChecksumChunk(args GetChunkArgs, checksum *uint64) error {
-	if !s.clientsaidhello {
+	if !s.clientsaidhello.Load() {
 		return ErrPleaseSayHello
 	}
+	if s.readGate != nil {
+		release := s.readGate.acquire()
+		started := time.Now()
+		defer func() { release(args.Size, time.Since(started)) }()
+	}
+
 	Logger.Trace().Msgf("Checksumming chunk from file %s at offset %d size %d", args.Path, args.Offset, args.Size)
 	s.filesMu.Lock()
 	fh, found := s.files[args.Path]
@@ -205,11 +279,12 @@ func (s *Server) ChecksumChunk(args GetChunkArgs, checksum *uint64) error {
 	if !found {
 		return errors.New("file handle not found")
 	}
-	if args.Size > uint64(int(^uint(0)>>1)) {
+	if args.Size > 16*1024*1024 || args.Offset > (1<<63-1)-args.Size {
 		return fmt.Errorf("chunk size too large: %d", args.Size)
 	}
 	data := make([]byte, int(args.Size))
-	n, err := fh.ReadAt(data, int64(args.Offset))
+	var n int
+	err := timedIO(&s.localIO, &s.activeIO, func() error { var e error; n, e = fh.ReadAt(data, int64(args.Offset)); return e })
 	if err != nil {
 		return err
 	}
@@ -222,7 +297,12 @@ func (s *Server) ChecksumChunk(args GetChunkArgs, checksum *uint64) error {
 }
 
 func (s *Server) Close(path string, reply *interface{}) error {
-	if !s.clientsaidhello {
+	if s.metadataGate != nil {
+		release := s.metadataGate.acquire()
+		defer release(0, 0)
+	}
+
+	if !s.clientsaidhello.Load() {
 		return ErrPleaseSayHello
 	}
 	Logger.Trace().Msgf("Closing file %s", path)
@@ -239,4 +319,59 @@ func (s *Server) Close(path string, reply *interface{}) error {
 
 func (s *Server) Wait() {
 	<-s.shutdown
+}
+
+// Hash provides independent full-file verification, without exposing a writable RPC.
+func (s *Server) Hash(path string, reply *string) error {
+	if !s.clientsaidhello.Load() {
+		return ErrPleaseSayHello
+	}
+	local, err := s.localPath(path)
+	if err != nil {
+		return err
+	}
+	info, err := lstatNoFollow(local)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("hash requires a regular file")
+	}
+	digest, err := hashFile(local)
+	if err == nil {
+		*reply = digest
+	}
+	return err
+}
+
+// Each connection owns its handles and negotiated options.
+func (s *Server) NewSession() *Server {
+	session := NewServer()
+	session.metadataGate = s.metadataGate
+	session.AutoTune, session.readGate, session.tuning = s.AutoTune, s.readGate, s.tuning
+	session.BasePath, session.Perf, session.shutdown = s.BasePath, s.Perf, s.shutdown
+	return session
+}
+func (s *Server) CloseFiles() {
+	if s.tuning != nil {
+		s.tuning.mu.Lock()
+		if s.tuning.owner == s {
+			s.tuning.owner = nil
+			s.tuning.turn = 0
+		}
+		s.tuning.mu.Unlock()
+	}
+
+	s.filesMu.Lock()
+	defer s.filesMu.Unlock()
+	for path, file := range s.files {
+		_ = file.Close()
+		delete(s.files, path)
+	}
+}
+
+func (s *Server) trackIO() func() {
+	started := time.Now()
+	s.activeIO.Add(1)
+	return func() { s.localIO.Add(uint64(time.Since(started))); s.activeIO.Add(-1) }
 }

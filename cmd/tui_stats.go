@@ -20,7 +20,7 @@ import (
 	"github.com/mum4k/termdash/linestyle"
 	"github.com/mum4k/termdash/terminal/tcell"
 	"github.com/mum4k/termdash/terminal/terminalapi"
-	"github.com/mum4k/termdash/widgets/linechart"
+
 	"github.com/mum4k/termdash/widgets/text"
 	"github.com/rs/zerolog"
 )
@@ -87,7 +87,11 @@ func sanitizeDashboardText(value string) string {
 }
 
 type stats struct {
+	rates                                    []metricRates
+	tuning                                   fastsync.TransferTuning
+	bottleneck                               fastsync.BottleneckStatus
 	elapsed                                  time.Duration
+	interval                                 time.Duration
 	performance                              fastsync.PerformanceEntry
 	total                                    fastsync.PerformanceEntry
 	inodecache, directorycache, files, stack int
@@ -110,8 +114,13 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		var total fastsync.PerformanceEntry
+		var rolling rateHistory
 		started := time.Now()
+		previous := started
 		collect := func(publish bool) {
+			now := time.Now()
+			interval := now.Sub(previous)
+			previous = now
 			history := client.Perf.NextHistory()
 			total = total.Add(history)
 			if !publish {
@@ -119,7 +128,10 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 			}
 			inodes, directories, files, stack := client.Stats()
 			sample := stats{
-				elapsed:        time.Since(started),
+				elapsed:        now.Sub(started),
+				interval:       interval,
+				bottleneck:     client.Diagnostics(),
+				tuning:         client.Tuning(),
 				performance:    history,
 				total:          total,
 				inodecache:     inodes,
@@ -127,6 +139,7 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 				files:          files,
 				stack:          stack,
 			}
+			sample.rates = rolling.collect(sample)
 			select {
 			case collector.samples <- sample:
 			default:
@@ -146,47 +159,36 @@ func startStatsCollector(client *fastsync.Client, interval time.Duration) *stats
 	return collector
 }
 
-const maxGraphSamples = 60
-
-type graphSeries struct {
-	localRead, localWrite, receivedOverWire, processed []float64
-}
-
-func appendGraphSample(series graphSeries, sample stats, capacity int) graphSeries {
-	limit := maxGraphSamples
-	if capacity > 0 && capacity < limit {
-		limit = capacity
-	}
-	appendValue := func(values []float64, value uint64) []float64 {
-		values = append(values, float64(value))
-		if len(values) > limit {
-			values = values[len(values)-limit:]
-		}
-		return values
-	}
-	series.localRead = appendValue(series.localRead, sample.performance.Get(fastsync.ReadBytes))
-	series.localWrite = appendValue(series.localWrite, sample.performance.Get(fastsync.WrittenBytes))
-	series.receivedOverWire = appendValue(series.receivedOverWire, sample.performance.Get(fastsync.RecievedOverWire))
-	series.processed = appendValue(series.processed, sample.performance.Get(fastsync.BytesProcessed))
-	return series
-}
-
 func formatStats(sample stats) string {
 	current := sample.performance
 	total := sample.total
 	var out strings.Builder
 	fmt.Fprintf(&out, "Status       Running\n")
+	if sample.tuning.Phase == 1 {
+		fmt.Fprintln(&out, "Pass         Existing files")
+	} else if sample.tuning.Phase == 2 {
+		fmt.Fprintln(&out, "Pass         Link/copy")
+	}
+	fmt.Fprintf(&out, "Reuse groups %d\n", total.Get(fastsync.ReuseGroups))
+	label := sample.bottleneck.Label
+	if label == "" {
+		label = "Unknown"
+	}
+	fmt.Fprintf(&out, "Bottleneck   %s\n", label)
+	if sample.tuning.FileLimit > 0 {
+		fmt.Fprintf(&out, "Read limit   %d\nWrite limit  %d (%d active)\nStream files %d/%d\nBuffer bound %s/%s\n", sample.tuning.ReadLimit, sample.tuning.WriteLimit, sample.tuning.ActiveWrites, sample.tuning.ActiveFiles, sample.tuning.FileLimit, humanize.Bytes(uint64(sample.tuning.BufferReserved)), humanize.Bytes(uint64(sample.tuning.BufferLimit)))
+	}
+	if sample.tuning.FlushCount > 0 || sample.tuning.PendingFlushFiles > 0 {
+		fmt.Fprintf(&out, "Flush queue  %d files / %s\nFile flush   %s\n", sample.tuning.PendingFlushFiles, humanize.Bytes(sample.tuning.PendingFlushBytes), sample.tuning.LastFlush.Round(time.Millisecond))
+	}
+
 	fmt.Fprintf(&out, "Elapsed      %s\n\n", sample.elapsed.Round(time.Second))
-	fmt.Fprintf(&out, "Wire         %s/s\n", humanize.Bytes(current.Get(fastsync.SentOverWire)+current.Get(fastsync.RecievedOverWire)))
-	fmt.Fprintf(&out, "Payload      %s/s\n", humanize.Bytes(current.Get(fastsync.SentBytes)+current.Get(fastsync.RecievedBytes)))
-	fmt.Fprintf(&out, "Local read   %s/s\n", humanize.Bytes(current.Get(fastsync.ReadBytes)))
-	fmt.Fprintf(&out, "Local write  %s/s\n", humanize.Bytes(current.Get(fastsync.WrittenBytes)))
-	fmt.Fprintf(&out, "Processed    %s/s\n", humanize.Bytes(current.Get(fastsync.BytesProcessed)))
-	fmt.Fprintf(&out, "Files        %d/s\n", current.Get(fastsync.FilesProcessed))
-	fmt.Fprintf(&out, "Directories  %d/s\n\n", current.Get(fastsync.DirectoriesProcessed))
-	fmt.Fprintf(&out, "Transferred  %s\n", humanize.Bytes(total.Get(fastsync.SentBytes)+total.Get(fastsync.RecievedBytes)))
-	fmt.Fprintf(&out, "Files total  %d\n", total.Get(fastsync.FilesProcessed))
-	fmt.Fprintf(&out, "Dirs total   %d\n\n", total.Get(fastsync.DirectoriesProcessed))
+	out.WriteString(formatRateTable(sample))
+	fmt.Fprintln(&out)
+	fmt.Fprintf(&out, "Check/copy/link %d/%d/%d\nDependencies %d\n", sample.tuning.CheckQueue, sample.tuning.CopyQueue, sample.tuning.LinkQueue, sample.tuning.Dependencies)
+	if n := current.Get(fastsync.QueueDispatches); n > 0 {
+		fmt.Fprintf(&out, "Queue wait   %s avg\n", (time.Duration(current.Get(fastsync.QueueWaitNanos) / n)).Round(time.Millisecond))
+	}
 	fmt.Fprintf(&out, "File queue   %d\n", sample.files)
 	fmt.Fprintf(&out, "Dir stack    %d\n", sample.stack)
 	fmt.Fprintf(&out, "Inode cache  %d\n", sample.inodecache)
@@ -202,8 +204,11 @@ func writeStats(view *text.Text, sample stats) error {
 	}{
 		{label: "[] Local read", color: cell.ColorGreen},
 		{label: "[] Local write", color: cell.ColorBlue},
-		{label: "[] Wire receive", color: cell.ColorYellow},
-		{label: "[] Processed", color: cell.ColorMagenta},
+		{label: "[] Wire", color: cell.ColorYellow},
+		{label: "[] Dir", color: cell.ColorCyan},
+		{label: "[] Link", color: cell.ColorYellow},
+		{label: "[] Same", color: cell.ColorGreen},
+		{label: "[] Copied", color: cell.ColorMagenta},
 	}
 	for _, item := range legend {
 		if err := view.Write(item.label+"\n", text.WriteCellOpts(cell.FgColor(item.color))); err != nil {
@@ -234,16 +239,9 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 	}
 	defer terminal.Close()
 
-	chart, err := linechart.New(
-		linechart.YAxisFormattedValues(func(value float64) string {
-			return humanize.Bytes(uint64(value)) + "/s"
-		}),
-		linechart.XAxisUnscaled(),
-	)
-	if err != nil {
-		return fmt.Errorf("create throughput chart: %w", err)
-	}
-	statsView, err := text.New(text.WrapAtWords())
+	chart := &historyChart{}
+	activity := &historyChart{stacked: true}
+	statsView, err := text.New()
 	if err != nil {
 		return fmt.Errorf("create statistics view: %w", err)
 	}
@@ -256,14 +254,18 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 	}
 
 	root, err := container.New(terminal,
-		container.SplitHorizontal(
-			container.Top(container.SplitVertical(
-				container.Left(container.Border(linestyle.Light), container.BorderTitle("Throughput"), container.PlaceWidget(chart)),
-				container.Right(container.Border(linestyle.Light), container.BorderTitle("Statistics"), container.PlaceWidget(statsView)),
+		container.SplitVertical(
+			container.Left(container.SplitHorizontal(
+				container.Top(container.SplitVertical(
+					container.Left(container.Border(linestyle.Light), container.BorderTitle("Throughput (bytes/s)"), container.PlaceWidget(chart)),
+					container.Right(container.Border(linestyle.Light), container.BorderTitle("Activity (entries/s)"), container.PlaceWidget(activity)),
+					container.SplitPercent(50),
+				)),
+				container.Bottom(container.Border(linestyle.Light), container.BorderTitle("Log"), container.PlaceWidget(logView)),
 				container.SplitPercent(75),
 			)),
-			container.Bottom(container.Border(linestyle.Light), container.BorderTitle("Log"), container.PlaceWidget(logView)),
-			container.SplitPercent(65),
+			container.Right(container.Border(linestyle.Light), container.BorderTitle("Statistics"), container.PlaceWidget(statsView)),
+			container.SplitPercent(60),
 		),
 	)
 	if err != nil {
@@ -282,27 +284,12 @@ func showStatsTUI(statsCh <-chan stats, ready chan<- dashboardReady) (retErr err
 	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
 	go func() {
-		var series graphSeries
 		for sample := range statsCh {
 			if err := writeStats(statsView, sample); err != nil {
 				fastsync.Logger.Error().Msgf("Update dashboard statistics: %v", err)
 			}
-			series = appendGraphSample(series, sample, chart.ValueCapacity())
-			updates := []struct {
-				name   string
-				values []float64
-				color  cell.Color
-			}{
-				{name: "Local read", values: series.localRead, color: cell.ColorGreen},
-				{name: "Local write", values: series.localWrite, color: cell.ColorBlue},
-				{name: "Wire receive", values: series.receivedOverWire, color: cell.ColorYellow},
-				{name: "Processed", values: series.processed, color: cell.ColorMagenta},
-			}
-			for _, update := range updates {
-				if err := chart.Series(update.name, update.values, linechart.SeriesCellOpts(cell.FgColor(update.color))); err != nil {
-					fastsync.Logger.Error().Msgf("Update dashboard graph: %v", err)
-				}
-			}
+			chart.add(sample)
+			activity.add(sample)
 		}
 		cancel()
 	}()

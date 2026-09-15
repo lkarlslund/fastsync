@@ -1,15 +1,13 @@
 package fastsync
 
 import (
+	"errors"
 	"fmt"
-	"io/fs"
 	"net/rpc"
-	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/cespare/xxhash/v2"
 )
 
 type inodeKey struct {
@@ -17,71 +15,95 @@ type inodeKey struct {
 }
 
 type inodeinfo struct {
-	dev, inode           uint64
-	localhardlinkpath    string
-	localdev, localinode uint64
-	remaining            int32
+	seed              *reuseSeed
+	seedOnce          sync.Once
+	seedErr           error
+	localhardlinkpath string
+	done              chan struct{}
+	err               error  // published by closing done
+	remaining         uint64 // protected by inodesMu; counts completed paths
 }
 
 type dirinfo struct {
 	name         string
 	info         FileInfo
 	extraentries []string // files/folders that are local only, and should be deleted
-	remaining    int32
-}
-
-func waitForFileInfo(path string, attempts int, delay time.Duration) (FileInfo, error) {
-	var lastErr error
-	for attempt := 0; attempt < attempts; attempt++ {
-		info, err := PathToFileInfo(path)
-		if err == nil {
-			return info, nil
-		}
-		if !os.IsNotExist(err) {
-			return FileInfo{}, err
-		}
-		lastErr = err
-		if attempt+1 < attempts {
-			time.Sleep(delay)
-		}
-	}
-	return FileInfo{}, fmt.Errorf("hardlink target %s did not appear after %d attempts: %w", path, attempts, lastErr)
+	remaining    int64
 }
 
 type Client struct {
-	BasePath string
+	reuseLocks [256]sync.Mutex
+	warming    bool // changed only between joined passes
+	phase      atomic.Int32
+	BasePath   string
+	SourcePath string
+
+	FlushInterval       time.Duration
+	writtenTotal        atomic.Uint64
+	lastCheckpoint      time.Time
+	lastCheckpointBytes uint64
+	checkpointOverride  func() error
+
+	flusher                  *fileFlusher
+	FlushBytes               int64
+	FlushFiles, FlushWorkers int
 
 	AlwaysChecksum bool
+	Durable        bool // Flush each staged file and its parent before reporting completion.
 
 	Options SharedOptions
 
-	Delete bool
+	Delete                             bool
+	MetadataParallel                   int
+	metadataGate                       *ioGate
+	Pipeline, AutoTune                 bool
+	WriteParallel, CachedFiles         int
+	BufferBytes                        int64
+	writerFiles, streamGate, writeGate *ioGate
+	tuningMu                           sync.Mutex
+	tuningState                        TransferTuning
 
 	ParallelFile, ParallelDir, QueueSize int
 	PreserveHardlinks                    bool
 	BlockSize                            int
 
-	dirWorkerWG, fileWorkerWG sync.WaitGroup
+	fileWorkerWG sync.WaitGroup
 
-	filequeue chan FileInfo
-	inodesMu  sync.Mutex
-	inodes    map[inodeKey]*inodeinfo
+	filequeue   chan FileInfo
+	inodesMu    sync.Mutex
+	inodes      map[inodeKey]*inodeinfo
+	localOwners map[inodeKey]inodeKey // shared destination inode -> source inode
 
 	dircacheMu sync.Mutex
 	dircache   map[string]*dirinfo
 
-	dirstack    *stack[FileInfo]
-	dirqueuein  chan<- FileInfo
-	dirqueueout <-chan FileInfo
+	directoryPending atomic.Int64
 
-	Perf *performance
+	errorsMu   sync.Mutex
+	errorCount uint64
+	firstError error
+
+	queueMu        sync.Mutex
+	remoteClient   *rpc.Client
+	localIO        atomic.Uint64
+	activeIO       atomic.Int64
+	diagnosticsMu  sync.Mutex
+	diagnostics    BottleneckStatus
+	schedulingPeak atomic.Int64
+	stageQueued    [3]atomic.Int64
+	dependencies   atomic.Int64
+	Perf           *performance
 }
 
 func NewClient() *Client {
 	c := &Client{
-		ParallelFile:      4096,
-		QueueSize:         16384,
-		ParallelDir:       512,
+		FlushInterval: 30 * time.Second,
+		FlushBytes:    256 << 20, FlushFiles: 64, FlushWorkers: 64,
+		ParallelFile:     64,
+		MetadataParallel: 8,
+		WriteParallel:    64, CachedFiles: 64, BufferBytes: 128 * 1024 * 1024,
+		QueueSize:         1024,
+		ParallelDir:       8,
 		PreserveHardlinks: true,
 		BlockSize:         16 * 1024,
 		Options: SharedOptions{
@@ -95,27 +117,46 @@ func NewClient() *Client {
 	return c
 }
 
-func (c *Client) Run(client *rpc.Client) error {
+func (c *Client) Run(client *rpc.Client) (runErr error) {
 	if err := c.validateQueueSettings(); err != nil {
 		return err
 	}
 
-	// Start the process
-	var listfilesActive sync.WaitGroup
+	if err := c.initPipeline(); err != nil {
+		return err
+	}
 
-	c.dirstack, c.dirqueueout, c.dirqueuein = NewStack[FileInfo](c.ParallelDir*2, 8)
+	c.errorsMu.Lock()
+	c.errorCount, c.firstError = 0, nil
+	c.errorsMu.Unlock()
+
+	c.queueMu.Lock()
 	c.filequeue = make(chan FileInfo, c.QueueSize)
+	c.queueMu.Unlock()
+	c.remoteClient = client
+	c.schedulingPeak.Store(0)
+	c.dependencies.Store(0)
 	c.inodesMu.Lock()
 	c.inodes = make(map[inodeKey]*inodeinfo)
+	c.localOwners = make(map[inodeKey]inodeKey)
 	c.inodesMu.Unlock()
 	c.dircacheMu.Lock()
 	c.dircache = make(map[string]*dirinfo)
 	c.dircacheMu.Unlock()
 
-	err := client.Call("Server.Hello", &c.Options, nil)
+	err := c.hello(client)
 	if err != nil {
 		return err
 	}
+
+	stopTuning, err := c.startTuning(client)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, stopTuning()) }()
+
+	stopDiagnostics := c.startDiagnostics(client)
+	defer stopDiagnostics()
 
 	// Check that remote path exists and we can connect to server
 
@@ -124,475 +165,34 @@ func (c *Client) Run(client *rpc.Client) error {
 	if err != nil {
 		return err
 	}
-	Logger.Debug().Msg("Queueing directory / from remote")
-	listfilesActive.Add(1)
-	c.dircacheMu.Lock()
-	c.dircache[rootdirinfo.Name] = &dirinfo{
-		name:      rootdirinfo.Name,
-		info:      rootdirinfo,
-		remaining: -1,
+	if !rootdirinfo.IsDir {
+		return fmt.Errorf("source root is not a directory")
 	}
-	c.dircacheMu.Unlock()
-	c.dirqueuein <- rootdirinfo
-
-	// Launch directory workers
-	for i := 0; i < c.ParallelDir; i++ {
-		c.dirWorkerWG.Add(1)
-		go func() {
-			Logger.Trace().Msg("Starting directory worker")
-			var filelistresponse FileListResponse
-			for item := range c.dirqueueout {
-				Logger.Trace().Msgf("Processing directory queue item for %s", item.Name)
-
-				filelistresponse.Files = filelistresponse.Files[:0]
-				err := client.Call("Server.List", item.Name, &filelistresponse)
-
-				Logger.Trace().Msgf("Listfiles response for directory %v: %v entries", item.Name, len(filelistresponse.Files))
-				if err != nil {
-					Logger.Error().Msgf("Error listing remote files in %v: %v", item.Name, err)
-					c.ProcessedItemInDir(item.Name)
-					listfilesActive.Done()
-					continue
-				}
-
-				var filecount int
-				remotenames := map[string]struct{}{}
-				for _, remotefi := range filelistresponse.Files {
-					remotenames[remotefi.Name] = struct{}{}
-					if !remotefi.IsDir {
-						filecount++
-					}
-				}
-
-				var extraentries []string
-				if c.Delete {
-					localentries, err := os.ReadDir(filepath.Join(c.BasePath, item.Name))
-					if err != nil {
-						Logger.Error().Msgf("Error listing local files in %v: %v", item.Name, err)
-					} else {
-						for _, le := range localentries {
-							if _, found := remotenames[filepath.Join(item.Name, le.Name())]; !found {
-								extraentries = append(extraentries, le.Name())
-							}
-						}
-					}
-				}
-
-				processentries := len(filelistresponse.Files)
-				Logger.Trace().Msgf("Directory %v has %v remote entries (%v to delete local)", item.Name, len(filelistresponse.Files), len(extraentries))
-
-				var directoryfound bool
-				c.dircacheMu.Lock()
-				if f, found := c.dircache[item.Name]; found {
-					f.remaining = int32(processentries)
-					f.extraentries = extraentries
-					directoryfound = true
-				}
-				c.dircacheMu.Unlock()
-				if !directoryfound {
-					Logger.Error().Msgf("directory %v not found in directory cache", filelistresponse.ParentDirectory)
-				}
-
-				if processentries == 0 {
-					// Handle it now
-					Logger.Trace().Msgf("No contents in folder %v detected", item.Name)
-					c.ProcessedItemInDir(item.Name)
-				} else {
-					// queue files first
-					for _, remotefi := range filelistresponse.Files {
-						if !remotefi.IsDir {
-							Logger.Trace().Msgf("Queueing file %s", remotefi.Name)
-							c.filequeue <- remotefi
-						}
-					}
-
-					// queue directories second
-					for _, remotefi := range filelistresponse.Files {
-						if remotefi.IsDir {
-							localpath := filepath.Join(c.BasePath, remotefi.Name)
-							// logger.Trace().Msgf("Queueing directory %s", remotefi.Name)
-							// check if directory exists
-							localstat, err := PathToFileInfo(localpath)
-							if os.IsNotExist(err) {
-								Logger.Trace().Msgf("Creating directory %s", localpath)
-								err = os.MkdirAll(localpath, 0755)
-								if err != nil {
-									Logger.Error().Msgf("Error creating directory %v: %v", localpath, err)
-									c.ProcessedItemInDir(item.Name)
-									continue
-								}
-							} else if err == nil {
-								if !localstat.IsDir {
-									Logger.Debug().Msgf("Existing target for directory %v is not a directory, deleteing it", localpath)
-									err = os.RemoveAll(localpath)
-									if err != nil {
-										Logger.Error().Msgf("Error removing path %v: %v", localpath, err)
-									}
-									Logger.Trace().Msgf("Creating directory %s", localpath)
-									err = os.MkdirAll(localpath, 0755)
-									if err != nil {
-										Logger.Error().Msgf("Error creating directory %v: %v", localpath, err)
-										c.ProcessedItemInDir(item.Name)
-										continue
-									}
-								}
-							} else {
-								Logger.Warn().Msgf("Error getting information about path %v: %v", localpath, err)
-							}
-							Logger.Trace().Msgf("Queueing directory %v", remotefi.Name)
-							listfilesActive.Add(1)
-							c.dircacheMu.Lock()
-							c.dircache[remotefi.Name] = &dirinfo{
-								name:      remotefi.Name,
-								info:      remotefi,
-								remaining: -1, // we don't know yet
-							}
-							c.dircacheMu.Unlock()
-							c.dirqueuein <- remotefi
-						}
-					}
-				}
-
-				c.Perf.Add(DirectoriesProcessed, 1)
-				listfilesActive.Done()
-			}
-			Logger.Trace().Msg("Shutting down directory worker")
-			c.dirWorkerWG.Done()
-		}()
+	if st, err := lstatNoFollow(c.BasePath); err != nil || !st.IsDir() {
+		return fmt.Errorf("destination must be an existing directory: %s", c.BasePath)
 	}
-
-	for i := 0; i < c.ParallelFile; i++ {
-		c.fileWorkerWG.Add(1)
-		go func() {
-			Logger.Trace().Msg("Starting file worker")
-
-			var data, localdata []byte // placed here in order to reuse the same buffers
-			var hash uint64
-
-			for remotefi := range c.filequeue {
-				func() {
-					defer c.ProcessedItemInDir(filepath.Dir(remotefi.Name))
-
-					localpath := filepath.Join(c.BasePath, remotefi.Name)
-					Logger.Trace().Msgf("Processing file %s", localpath)
-
-					create_file := false
-					copy_verify_file := false // do we need to copy it
-					apply_attributes := false // do we need to update owner etc.
-
-					localfi, err := PathToFileInfo(localpath)
-					if err != nil {
-						if os.IsNotExist(err) {
-							Logger.Debug().Msgf("File %s does not exist", localpath)
-							localfi.Name = localpath
-							create_file = true
-						} else {
-							Logger.Error().Msgf("Error getting fileinfo for local path %s: %v", localpath, err)
-							return
-						}
-					}
-
-					// Ignore it
-					if !c.Options.SendXattr {
-						localfi.Xattrs = nil
-					}
-
-					remaininghardlinks := int32(-1) // not relevant
-					var justaddedtoinodecache bool
-					if c.PreserveHardlinks && remotefi.Nlink > 1 {
-						Logger.Trace().Msgf("Saving/updating remote dev/inode number %v/%v to cache for file %s with %d hardlinks", remotefi.Dev, remotefi.Inode, remotefi.Name, remotefi.Nlink)
-						key := inodeKey{dev: remotefi.Dev, inode: remotefi.Inode}
-						c.inodesMu.Lock()
-						i, found := c.inodes[key]
-						if !found {
-							i = &inodeinfo{
-								dev:               remotefi.Dev,
-								inode:             remotefi.Inode,
-								localhardlinkpath: localpath,
-								remaining:         int32(remotefi.Nlink),
-							}
-							c.inodes[key] = i
-						}
-						i.remaining--
-						remaininghardlinks = i.remaining
-						if remaininghardlinks == int32(remotefi.Nlink-1) {
-							Logger.Trace().Msgf("Added file %s to inode cache", remotefi.Name)
-							justaddedtoinodecache = true
-						}
-						if !create_file && i.localinode == 0 {
-							Logger.Trace().Msgf("Updated local inode for file %s", remotefi.Name)
-							i.localinode = localfi.Inode
-							i.localdev = localfi.Dev
-						}
-						c.inodesMu.Unlock()
-					}
-
-					// if it's a hardlinked file, check that it's linked correctly
-					if !create_file && remotefi.Nlink > 1 && c.PreserveHardlinks && !justaddedtoinodecache {
-						key := inodeKey{dev: remotefi.Dev, inode: remotefi.Inode}
-						c.inodesMu.Lock()
-						ini, found := c.inodes[key]
-						if found {
-							iniSnapshot := *ini
-							c.inodesMu.Unlock()
-							if iniSnapshot.localinode == 0 {
-								// Find the local inode, we only need to do this once
-								otherlocalfi, err := waitForFileInfo(iniSnapshot.localhardlinkpath, 100, 10*time.Millisecond)
-								if err != nil {
-									Logger.Error().Msgf("Hardlink target unavailable for %s: %v", localpath, err)
-									return
-								}
-								c.inodesMu.Lock()
-								if i, found := c.inodes[key]; found && i.localinode == 0 {
-									i.localinode = otherlocalfi.Inode
-									i.localdev = otherlocalfi.Dev
-									iniSnapshot = *i
-								}
-								c.inodesMu.Unlock()
-							}
-
-							if localfi.Inode != iniSnapshot.localinode || localfi.Dev != iniSnapshot.localdev {
-								Logger.Debug().Msgf("Hardlink %s and %s have different inodes but should match, unlinking file", localpath, iniSnapshot.localhardlinkpath)
-								err = os.Remove(localpath)
-								if err != nil {
-									Logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
-									return
-								}
-								create_file = true
-							}
-						} else {
-							c.inodesMu.Unlock()
-						}
-					}
-
-					if !create_file && localfi.Mode&os.ModeType != remotefi.Mode&os.ModeType {
-						Logger.Debug().Msgf("File %s is indicating type change from %v to %v, unlinking", localpath, localfi.Mode.String(), remotefi.Mode.String())
-						err = os.Remove(localpath)
-						if err != nil {
-							Logger.Error().Msgf("Error unlinking %s: %v", localpath, err)
-							return
-						}
-
-						create_file = true
-					}
-
-					if !create_file { // still exists
-						if localfi.Size > remotefi.Size && remotefi.Mode&fs.ModeSymlink == 0 {
-							Logger.Debug().Msgf("File %s is indicating size change from %v to %v, truncating", localpath, localfi.Size, remotefi.Size)
-							err = os.Truncate(localpath, int64(remotefi.Size))
-							if err != nil {
-								Logger.Error().Msgf("Error truncating %s to %v bytes to match remote: %v", localpath, remotefi.Size, err)
-								return
-							}
-							apply_attributes = true
-						}
-						if localfi.Mtim.Nano() != remotefi.Mtim.Nano() {
-							Logger.Debug().Msgf("File %s is indicating time change from %v to %v, applying attribute changes", localpath, time.Unix(0, localfi.Mtim.Nano()), time.Unix(0, remotefi.Mtim.Nano()))
-							apply_attributes = true
-						}
-
-						if localfi.Mode.Perm() != remotefi.Mode.Perm() || localfi.Owner != remotefi.Owner || localfi.Group != remotefi.Group {
-							Logger.Debug().Msgf("File %s is indicating permissions changes, applying attribute changes", localpath)
-							apply_attributes = true
-						}
-
-					}
-
-					if create_file {
-						apply_attributes = true
-					}
-
-					if remotefi.Size > 0 && remotefi.Mode&fs.ModeSymlink == 0 && (apply_attributes || c.AlwaysChecksum) {
-						Logger.Debug().Msgf("Doing file content validation for %s", localpath)
-						copy_verify_file = true
-					}
-
-					// try to hard link it
-					if create_file && c.PreserveHardlinks && remotefi.Nlink > 1 && !justaddedtoinodecache {
-						key := inodeKey{dev: remotefi.Dev, inode: remotefi.Inode}
-						c.inodesMu.Lock()
-						ini, found := c.inodes[key]
-						if found {
-							iniSnapshot := *ini
-							c.inodesMu.Unlock()
-							if localpath != iniSnapshot.localhardlinkpath {
-								Logger.Debug().Msgf("Hardlinking %s to %s", localpath, iniSnapshot.localhardlinkpath)
-								if _, err = waitForFileInfo(iniSnapshot.localhardlinkpath, 100, 10*time.Millisecond); err == nil {
-									err = os.Link(iniSnapshot.localhardlinkpath, localpath)
-								}
-								if err != nil {
-									Logger.Error().Msgf("Error hardlinking %s to %s: %v", localpath, iniSnapshot.localhardlinkpath, err)
-									return
-								}
-								create_file = false
-								copy_verify_file = false
-								apply_attributes = true
-							}
-						} else {
-							c.inodesMu.Unlock()
-							Logger.Error().Msgf("Remote file %s indicates it should be hardlinked with %v others, but we don't have a match locally", remotefi.Name, remotefi.Nlink)
-						}
-					}
-
-					transfersuccess := true
-
-					if create_file {
-						Logger.Info().Msgf("Creating file %s", localpath)
-					} else if copy_verify_file {
-						Logger.Info().Msgf("Updating/verifying file %s", localpath)
-					} else if apply_attributes {
-						Logger.Info().Msgf("Applying attributes to file %s", localpath)
-					}
-
-					if create_file {
-						err = localfi.Create(remotefi)
-						if err == ErrNotSupportedByPlatform {
-							Logger.Warn().Msgf("Skipping %s: %v", localpath, err)
-							return
-						} else if err != nil {
-							Logger.Error().Msgf("Error creating %s: %v", localpath, err)
-							return
-						}
-					}
-
-					if copy_verify_file {
-						// file exists but is different, copy it
-						Logger.Debug().Msgf("Processing blocks for %s", remotefi.Name)
-						var existingsize int64
-
-						// Open file if we didn't create it earlier
-						localfile, err := os.OpenFile(localpath, os.O_RDWR, fs.FileMode(remotefi.Mode))
-						if err != nil {
-							Logger.Error().Msgf("Error opening existing local file %s: %v", localpath, err)
-							return
-						}
-						fi, err := localfile.Stat()
-						if err != nil {
-							Logger.Error().Msgf("Error stating existing local file %s: %v", localpath, err)
-							if closeErr := localfile.Close(); closeErr != nil {
-								Logger.Error().Msgf("Error closing local file %s: %v", localpath, closeErr)
-							}
-							return
-						}
-						existingsize = fi.Size()
-
-						err = client.Call("Server.Open", remotefi.Name, nil)
-						if err != nil {
-							Logger.Error().Msgf("Error opening remote file %s: %v", remotefi.Name, err)
-							Logger.Error().Msgf("Item fileinfo: %+v", remotefi)
-							if closeErr := localfile.Close(); closeErr != nil {
-								Logger.Error().Msgf("Error closing local file %s: %v", localpath, closeErr)
-							}
-							return
-						}
-
-						for i := int64(0); i < remotefi.Size; i += int64(c.BlockSize) {
-							if !transfersuccess {
-								break // we couldn't open the remote file
-							}
-
-							// Read the chunk
-							length := int64(c.BlockSize)
-							if i+length > remotefi.Size {
-								length = remotefi.Size - i
-							}
-							chunkArgs := GetChunkArgs{
-								Path:   remotefi.Name,
-								Offset: uint64(i),
-								Size:   uint64(length),
-							}
-							if i+length <= existingsize {
-								err = client.Call("Server.ChecksumChunk", chunkArgs, &hash)
-								if err != nil {
-									Logger.Error().Msgf("Error getting remote checksum for file %s chunk at %d: %v", remotefi.Name, i, err)
-									transfersuccess = false
-								}
-
-								if cap(localdata) < int(length) {
-									localdata = make([]byte, length)
-								}
-								localdata = localdata[:int(length)]
-
-								n, err := localfile.ReadAt(localdata, i)
-								if err != nil {
-									Logger.Error().Msgf("Error reading existing local file %s chunk at %d: %v", localpath, i, err)
-									transfersuccess = false
-									break
-								}
-								c.Perf.Add(ReadBytes, uint64(length))
-								if n == int(length) {
-									localhash := xxhash.Sum64(localdata)
-									Logger.Trace().Msgf("Checksum for file %s chunk at %d is %X, remote is %X", remotefi.Name, i, localhash, hash)
-									if localhash == hash {
-										continue // Block matches
-									}
-								}
-							}
-
-							Logger.Debug().Msgf("Transferring file %s chunk at %d", remotefi.Name, i)
-							data = data[:0] // truncate it
-							err = client.Call("Server.GetChunk", chunkArgs, &data)
-							if err != nil {
-								Logger.Error().Msgf("Error transferring file %s chunk at %d: %v", remotefi.Name, i, err)
-								transfersuccess = false
-								break
-							}
-							n, err := localfile.WriteAt(data, i)
-							if err != nil {
-								Logger.Error().Msgf("Error writing to local file %s chunk at %d: %v", localpath, i, err)
-								transfersuccess = false
-								break
-							}
-							if n != int(length) {
-								Logger.Error().Msgf("Wrote %v bytes but expected to write %v", n, length)
-								transfersuccess = false
-								break
-							}
-							c.Perf.Add(WrittenBytes, uint64(length))
-							apply_attributes = true
-						}
-						err = client.Call("Server.Close", remotefi.Name, nil)
-						if err != nil {
-							Logger.Error().Msgf("Error closing remote file %s: %v", remotefi.Name, err)
-						}
-						if err := localfile.Close(); err != nil {
-							Logger.Error().Msgf("Error closing local file %s: %v", localpath, err)
-						}
-					}
-
-					if apply_attributes && transfersuccess {
-						Logger.Debug().Msgf("Updating metadata for %s", remotefi.Name)
-						err = localfi.ApplyChanges(remotefi)
-						if err != nil {
-							Logger.Error().Msgf("Error applying metadata for %s: %v", remotefi.Name, err)
-						}
-					}
-
-					// handle inode counters
-					if remaininghardlinks == 0 {
-						// No more references, free up some memory
-						Logger.Trace().Msgf("No more references to this inode, removing it from inode cache")
-						c.inodesMu.Lock()
-						delete(c.inodes, inodeKey{dev: remotefi.Dev, inode: remotefi.Inode})
-						c.inodesMu.Unlock()
-					}
-
-					c.Perf.Add(FilesProcessed, 1)
-					c.Perf.Add(BytesProcessed, uint64(remotefi.Size))
-				}()
-			}
-			Logger.Trace().Msg("Shutting down file worker")
-			c.fileWorkerWG.Done()
-		}()
+	if c.PreserveHardlinks {
+		c.phase.Store(1)
+		c.warming = true
+		Logger.Info().Msg("Pass 1: checking existing paths and warming hardlink cache")
+		c.warmExistingPass(client, rootdirinfo)
+		c.warming = false
+		// Warmup failures remain in the final error state, but must not prevent
+		// the second walk from copying accessible paths or retrying a listing.
+		if err := c.runError(); err != nil {
+			Logger.Warn().Err(err).Msg("Existing-file scan had errors; continuing with link/copy pass")
+		}
+		c.queueMu.Lock()
+		c.filequeue = make(chan FileInfo, c.QueueSize)
+		c.queueMu.Unlock()
 	}
+	c.phase.Store(2)
+	Logger.Info().Msg("Pass 2: reusing existing inodes, then copying missing data")
+	c.directoryPending.Store(0)
+	c.fileWorkerWG.Add(1)
+	go func() { defer c.fileWorkerWG.Done(); c.scheduleFiles(client) }()
+	c.walkAlphabetical(client, rootdirinfo)
 
-	// wait for all directories to be listed
-	listfilesActive.Wait()
-	Logger.Debug().Msg("No more directories to list")
-	// close the directory stack
-	c.dirstack.Close()
-	// wait for all directory workers to finish
-	c.dirWorkerWG.Wait()
 	// close the file queue so file workers can finish
 	close(c.filequeue)
 	// wait for all workers to finish
@@ -600,7 +200,7 @@ func (c *Client) Run(client *rpc.Client) error {
 
 	Logger.Debug().Msg("Client routine done")
 
-	return nil
+	return c.runError()
 }
 
 func (c *Client) validateQueueSettings() error {
@@ -613,6 +213,9 @@ func (c *Client) validateQueueSettings() error {
 	if c.QueueSize < 0 {
 		return fmt.Errorf("QueueSize must be non-negative, got %d", c.QueueSize)
 	}
+	if c.BlockSize > 16*1024*1024 {
+		return fmt.Errorf("BlockSize must not exceed 16 MiB")
+	}
 	if c.BlockSize < 1 {
 		return fmt.Errorf("BlockSize must be at least 1, got %d", c.BlockSize)
 	}
@@ -620,6 +223,9 @@ func (c *Client) validateQueueSettings() error {
 }
 
 func (c *Client) ProcessedItemInDir(path string) {
+	if c.warming {
+		return
+	}
 	donewithdirectory := false
 	founddirectory := false
 	var doneitem dirinfo
@@ -637,7 +243,7 @@ func (c *Client) ProcessedItemInDir(path string) {
 	}
 	c.dircacheMu.Unlock()
 	if !founddirectory {
-		Logger.Error().Msgf("Failed to find directory info for postprocessing %s", path)
+		c.recordError("Failed to find directory info for postprocessing %s", path)
 	}
 	if donewithdirectory {
 		c.PostProcessDir(&doneitem)
@@ -648,28 +254,39 @@ func (c *Client) ProcessedItemInDir(path string) {
 }
 
 func (c *Client) PostProcessDir(item *dirinfo) {
+	if err := checkRemote(c.remoteClient, item.info); err != nil {
+		c.recordError("%s: %v", item.name, err)
+		return
+	}
+	if c.runError() != nil {
+		return
+	}
 	if c.Delete {
 		for _, extraentry := range item.extraentries {
-			err := os.RemoveAll(filepath.Join(c.BasePath, item.name, extraentry))
+			err := removeAllNoFollow(filepath.Join(c.BasePath, item.name, extraentry))
 			if err != nil {
-				Logger.Error().Msgf("Error unlinking %v: %v", filepath.Join(c.BasePath, item.name, extraentry), err)
+				c.recordError("Error unlinking %v: %v", filepath.Join(c.BasePath, item.name, extraentry), err)
 			}
-			c.Perf.Add(EntriesDeleted, 1)
+			if err == nil {
+				c.Perf.Add(EntriesDeleted, 1)
+			}
 		}
 	}
 
 	// Apply modify times to directory
-	localdirfi, err := PathToFileInfo(filepath.Join(c.BasePath, item.name))
+	localdirfi, err := c.localFileInfo(filepath.Join(c.BasePath, item.name))
 	if err != nil {
-		Logger.Error().Msgf("Problem getting local directory information for %v: %v", filepath.Join(c.BasePath, item.name), err)
+		c.recordError("Problem getting local directory information for %v: %v", filepath.Join(c.BasePath, item.name), err)
 	} else {
-		if err := localdirfi.ApplyChanges(item.info); err != nil {
-			Logger.Error().Msgf("Problem applying directory metadata for %v: %v", filepath.Join(c.BasePath, item.name), err)
+		if err := c.applyMetadata(localdirfi, item.info); err != nil {
+			c.recordError("Problem applying directory metadata for %v: %v", filepath.Join(c.BasePath, item.name), err)
 		}
 	}
 }
 
 func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
 	c.inodesMu.Lock()
 	inodes = len(c.inodes)
 	c.inodesMu.Unlock()
@@ -678,5 +295,34 @@ func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
 	directories = len(c.dircache)
 	c.dircacheMu.Unlock()
 
-	return inodes, directories, len(c.filequeue), c.dirstack.Len()
+	directoriestack = int(c.directoryPending.Load())
+	return inodes, directories, len(c.filequeue), directoriestack
+}
+
+func (c *Client) recordError(format string, args ...any) {
+	err := fmt.Errorf(format, args...)
+	c.errorsMu.Lock()
+	c.errorCount++
+	if c.firstError == nil {
+		c.firstError = err
+	}
+	c.errorsMu.Unlock()
+	Logger.Error().Err(err).Msg("Sync failed")
+}
+func (c *Client) runError() error {
+	c.errorsMu.Lock()
+	defer c.errorsMu.Unlock()
+	if c.errorCount == 0 {
+		return nil
+	}
+	return fmt.Errorf("sync failed with %d error(s); first: %w", c.errorCount, c.firstError)
+}
+
+func (c *Client) hello(client *rpc.Client) error {
+	if c.SourcePath != "" {
+		if err := client.Call("Server.SelectRoot", c.SourcePath, nil); err != nil {
+			return fmt.Errorf("select source %q: %w", c.SourcePath, err)
+		}
+	}
+	return client.Call("Server.Hello", &c.Options, nil)
 }

@@ -10,6 +10,39 @@ import (
 	"time"
 )
 
+type counterTestStream struct {
+	bytes.Buffer
+}
+
+func (*counterTestStream) Close() error { return nil }
+
+func TestNetworkCountersKeepReceiveAndSendSeparate(t *testing.T) {
+	stream := &counterTestStream{}
+	stream.WriteString("incoming payload")
+	perf := NewPerformance()
+	wrapped := NewPerformanceWrapper(stream,
+		perf.GetAtomicAdder(RecievedOverWire),
+		perf.GetAtomicAdder(SentOverWire))
+	if _, err := io.ReadAll(wrapped); err != nil {
+		t.Fatal(err)
+	}
+	if got := perf.Get(RecievedOverWire); got != uint64(len("incoming payload")) {
+		t.Fatalf("received bytes = %d", got)
+	}
+	if got := perf.Get(SentOverWire); got != 0 {
+		t.Fatalf("read counted as sent: %d", got)
+	}
+	if _, err := wrapped.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if got := perf.Get(SentOverWire); got != uint64(len("request")) {
+		t.Fatalf("sent bytes = %d", got)
+	}
+	if got := perf.Get(RecievedOverWire); got != uint64(len("incoming payload")) {
+		t.Fatalf("write changed receive counter: %d", got)
+	}
+}
+
 func TestCompressedReadWriteCloserRoundTrip(t *testing.T) {
 	left, right := net.Pipe()
 	leftCompressed := CompressedReadWriteCloser(left)

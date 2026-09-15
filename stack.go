@@ -45,6 +45,8 @@ func NewStack[T any](inbuffer, outbuffer int) (*stack[T], <-chan T, chan<- T) {
 						}
 						last := len(s.data) - 1
 						output := s.data[last]
+						var zero T
+						s.data[last] = zero
 						s.data = s.data[:last]
 						s.lock.Unlock()
 						s.outchan <- output
@@ -55,8 +57,10 @@ func NewStack[T any](inbuffer, outbuffer int) (*stack[T], <-chan T, chan<- T) {
 				s.lock.Unlock()
 			case outputCh <- output:
 				s.lock.Lock()
+				var zero T
+				s.data[len(s.data)-1] = zero
 				s.data = s.data[:len(s.data)-1]
-				if len(s.data) > 16 && len(s.data)*4 < cap(s.data) {
+				if cap(s.data) > 64 && len(s.data)*4 < cap(s.data) {
 					newdata := make([]T, len(s.data))
 					copy(newdata, s.data)
 					s.data = newdata

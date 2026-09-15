@@ -67,6 +67,14 @@ const (
 	EntriesDeleted
 	FileQueue
 	FolderQueue
+	TransferredFileBytes // payload fetched from the source, excluding locally reused blocks
+	FilesUnchanged
+	FilesCopied
+	FilesLinked
+	QueueWaitNanos
+	QueueDispatches
+	ExistingExamined
+	ReuseGroups
 	maxperformancecountertype
 )
 
@@ -138,7 +146,11 @@ type PerformanceWrapperReadWriteCloser struct {
 }
 
 func NewPerformanceWrapper(rwc io.ReadWriteCloser, onRead, onWrite AtomicAdder) *PerformanceWrapperReadWriteCloser {
-	return &PerformanceWrapperReadWriteCloser{onRead, onWrite, rwc}
+	return &PerformanceWrapperReadWriteCloser{
+		onRead:  onRead,
+		onWrite: onWrite,
+		rwc:     rwc,
+	}
 }
 
 func (pw *PerformanceWrapperReadWriteCloser) Write(b []byte) (int, error) {

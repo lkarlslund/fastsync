@@ -103,39 +103,16 @@ func TestFormatStatsIncludesQueuesAndTotals(t *testing.T) {
 		performance: current, total: total, elapsed: 2 * time.Second,
 		inodecache: 3, directorycache: 4, files: 5, stack: 6,
 	})
-	for _, want := range []string{"Local write  1.0 kB/s", "Files total  2", "File queue   5", "Dir stack    6", "Inode cache  3", "Dir cache    4"} {
+	for _, want := range []string{"Instant", "1m", "5m", "Total", "Write       1.0kB", "Files         2.0", "File queue   5", "Dir stack    6", "Inode cache  3", "Dir cache    4"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("formatStats() missing %q:\n%s", want, got)
 		}
 	}
 }
 
-func TestAppendGraphSampleKeepsVisibleWindow(t *testing.T) {
-	client := fastsync.NewClient()
-	var series graphSeries
-	for i := 1; i <= 10; i++ {
-		client.Perf.Add(fastsync.ReadBytes, uint64(i))
-		series = appendGraphSample(series, stats{performance: client.Perf.NextHistory()}, 4)
-	}
-	if got, want := len(series.localRead), 4; got != want {
-		t.Fatalf("visible samples = %d, want %d", got, want)
-	}
-	if got, want := series.localRead[0], float64(7); got != want {
-		t.Fatalf("first visible sample = %.0f, want %.0f", got, want)
-	}
-}
-
-func TestAppendGraphSampleDropsAgedSpike(t *testing.T) {
-	client := fastsync.NewClient()
-	client.Perf.Add(fastsync.BytesProcessed, 1_000_000)
-	series := appendGraphSample(graphSeries{}, stats{performance: client.Perf.NextHistory()}, 3)
-	for range 3 {
-		client.Perf.Add(fastsync.BytesProcessed, 10)
-		series = appendGraphSample(series, stats{performance: client.Perf.NextHistory()}, 3)
-	}
-	for _, value := range series.processed {
-		if value == 1_000_000 {
-			t.Fatal("aged spike remains in visible graph window")
-		}
+func TestStatisticsShowBottleneck(t *testing.T) {
+	got := formatStats(stats{bottleneck: fastsync.BottleneckStatus{Label: "Server IO"}})
+	if !strings.Contains(got, "Bottleneck   Server IO") {
+		t.Fatalf("missing bottleneck: %s", got)
 	}
 }

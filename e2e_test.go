@@ -182,8 +182,8 @@ func TestClientServerSyncUpdatesExistingFileByChunks(t *testing.T) {
 	if got, want := readTestFile(t, dest, "chunked.txt"), "aaaabbbbcccc"; got != want {
 		t.Fatalf("chunked.txt = %q, want %q", got, want)
 	}
-	if got, wantLessThan := client.Perf.Get(WrittenBytes), uint64(len("aaaabbbbcccc")); got >= wantLessThan {
-		t.Fatalf("written bytes = %d, want less than %d to prove matching chunks were skipped", got, wantLessThan)
+	if got, wantLessThan := client.Perf.Get(TransferredFileBytes), uint64(len("aaaabbbbcccc")); got >= wantLessThan {
+		t.Fatalf("transferred file bytes = %d, want less than %d to prove matching chunks were skipped", got, wantLessThan)
 	}
 }
 
@@ -294,8 +294,8 @@ func TestClientServerSyncListErrorDoesNotHang(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("client run returned unexpected error: %v", err)
+		if err == nil {
+			t.Fatal("client run succeeded despite failed listing")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("client run did not finish after a child directory list failure")
@@ -325,16 +325,5 @@ func TestClientRejectsInvalidQueueSettings(t *testing.T) {
 				t.Fatal("Client.Run succeeded with invalid queue settings, want error")
 			}
 		})
-	}
-}
-
-func TestWaitForFileInfoIsBoundedWhenHardlinkTargetIsMissing(t *testing.T) {
-	started := time.Now()
-	_, err := waitForFileInfo(filepath.Join(t.TempDir(), "missing"), 3, time.Millisecond)
-	if err == nil {
-		t.Fatal("waitForFileInfo succeeded for missing path")
-	}
-	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
-		t.Fatalf("waitForFileInfo took %v, want bounded retry", elapsed)
 	}
 }

@@ -1,5 +1,5 @@
-//go:build !windows
-// +build !windows
+//go:build linux
+// +build linux
 
 package fastsync
 
@@ -14,19 +14,19 @@ import (
 func (fi FileInfo) Create(fi2 FileInfo) error {
 	if fi2.Mode&fs.ModeDevice != 0 {
 		if fi2.Mode&fs.ModeCharDevice != 0 {
-			return mkNod(fi.Name, syscall.S_IFCHR, fi2.Rdev)
+			return mknodNoFollow(fi.Name, syscall.S_IFCHR, fi2.Rdev)
 		} else {
 			// Block device
-			return mkNod(fi.Name, syscall.S_IFBLK, fi2.Rdev)
+			return mknodNoFollow(fi.Name, syscall.S_IFBLK, fi2.Rdev)
 		}
 	} else if fi2.Mode&fs.ModeNamedPipe != 0 {
-		return mkNod(fi.Name, syscall.S_IFIFO, fi2.Rdev)
+		return mknodNoFollow(fi.Name, syscall.S_IFIFO, fi2.Rdev)
 	} else if fi2.Mode&fs.ModeSocket != 0 {
-		return mkNod(fi.Name, syscall.S_IFSOCK, fi2.Rdev)
+		return mknodNoFollow(fi.Name, syscall.S_IFSOCK, fi2.Rdev)
 	} else if fi2.Mode&fs.ModeSymlink != 0 {
-		return syscall.Symlink(fi2.LinkTo, fi.Name)
+		return symlinkNoFollow(fi2.LinkTo, fi.Name)
 	}
-	file, err := os.Create(fi.Name)
+	file, err := OpenFileNoFollow(fi.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0666)
 	if err == nil {
 		err = file.Close()
 	}
@@ -34,15 +34,15 @@ func (fi FileInfo) Create(fi2 FileInfo) error {
 }
 
 func (fi *FileInfo) Chown(fi2 FileInfo) error {
-	return os.Lchown(fi.Name, int(fi2.Owner), int(fi2.Group))
+	return chownNoFollow(fi.Name, int(fi2.Owner), int(fi2.Group))
 }
 
 func (fi FileInfo) SetTimestamps(fi2 FileInfo) error {
-	return unix.UtimesNanoAt(unix.AT_FDCWD, fi.Name, []unix.Timespec{unix.Timespec(fi2.Atim), unix.Timespec(fi2.Mtim)}, unix.AT_SYMLINK_NOFOLLOW)
+	return timesNoFollow(fi.Name, []unix.Timespec{unix.Timespec(fi2.Atim), unix.Timespec(fi2.Mtim)})
 }
 
 func (fi FileInfo) Chmod(fi2 FileInfo) error {
-	return unix.Chmod(fi.Name, fi2.Permissions&uint32(os.ModePerm))
+	return chmodNoFollow(fi.Name, fi2.Permissions&07777)
 	// return unix.Fchmodat(unix.AT_FDCWD, f.Name, fi2.Permissions, unix.AT_SYMLINK_NOFOLLOW)
 }
 
