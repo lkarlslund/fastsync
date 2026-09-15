@@ -269,8 +269,14 @@ func (s historyScale) tick(value float64) string {
 	if v == 0 {
 		return "0"
 	}
+	if v > 0 && v < 0.001 {
+		return "<.001"
+	}
+	if v > 0 && v < 0.01 {
+		return fmt.Sprintf("%.3f", v)
+	}
 	if v > 0 && v < 0.1 {
-		return fmt.Sprintf("%.0e", v)
+		return fmt.Sprintf("%.2f", v)
 	}
 	if v >= 100 {
 		return fmt.Sprintf("%.0f", v)
