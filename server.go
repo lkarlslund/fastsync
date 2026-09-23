@@ -48,11 +48,38 @@ type Server struct {
 	shutdown        chan struct{}
 	filesMu         sync.Mutex
 	files           map[string]*os.File
+	root            *os.File
 
 	host     hostSampler
 	localIO  atomic.Uint64
 	activeIO atomic.Int64
 	Perf     *performance
+}
+
+// PinRoot keeps the source filesystem mounted while this server is running.
+func (s *Server) PinRoot() error {
+	if s.root != nil {
+		return errors.New("source root is already pinned")
+	}
+	base, err := DirectoryPathNoFollow(s.BasePath)
+	if err != nil {
+		return err
+	}
+	root, err := openNoFollow(base)
+	if err != nil {
+		return err
+	}
+	info, err := root.Stat()
+	if err != nil || !info.IsDir() {
+		_ = root.Close()
+		if err != nil {
+			return err
+		}
+		return errors.New("source root is not a directory")
+	}
+	s.BasePath = base
+	s.root = root
+	return nil
 }
 
 func (s *Server) localPath(path string) (string, error) {
@@ -95,14 +122,23 @@ func (s *Server) SelectRoot(path string, reply *any) error {
 	if err != nil || !filepath.IsLocal(rel) {
 		return ErrInvalidPath
 	}
-	info, err := lstatNoFollow(selected)
+	root, err := openNoFollow(selected)
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("selected source is not a directory")
+	info, err := root.Stat()
+	if err != nil || !info.IsDir() {
+		_ = root.Close()
+		if err != nil {
+			return err
+		}
+		return errors.New("selected source is not a directory")
+	}
+	if s.root != nil {
+		_ = s.root.Close()
 	}
 	s.BasePath = selected
+	s.root = root
 	return nil
 }
 
@@ -381,6 +417,10 @@ func (s *Server) CloseFiles() {
 	for path, file := range s.files {
 		_ = file.Close()
 		delete(s.files, path)
+	}
+	if s.root != nil {
+		_ = s.root.Close()
+		s.root = nil
 	}
 }
 

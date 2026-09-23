@@ -26,6 +26,10 @@ func newTestRPCClient(t *testing.T, sourceDir string) *rpc.Client {
 	rpcServer := rpc.NewServer()
 	server := NewServer()
 	server.BasePath = sourceDir
+	if err := server.PinRoot(); err != nil {
+		t.Fatalf("pin source root: %v", err)
+	}
+	t.Cleanup(server.CloseFiles)
 	registerTestRPCServer(t, rpcServer, server)
 
 	return newTestRPCClientForServer(t, rpcServer)

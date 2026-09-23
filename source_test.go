@@ -2,6 +2,7 @@ package fastsync
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,6 +36,10 @@ func TestSelectRootConfinementAndSessionIsolation(t *testing.T) {
 	}
 	s := NewServer()
 	s.BasePath = base
+	if err := s.PinRoot(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.CloseFiles()
 	for _, path := range []string{"../", base, "escape", "missing"} {
 		session := s.NewSession()
 		authenticateTestSession(t, session)
@@ -47,6 +52,11 @@ func TestSelectRootConfinementAndSessionIsolation(t *testing.T) {
 	if err := session.SelectRoot("server-a", nil); err != nil {
 		t.Fatal(err)
 	}
+	selectedRoot := session.root
+	if selectedRoot == nil {
+		t.Fatal("selected root was not pinned")
+	}
+	defer session.CloseFiles()
 	if s.BasePath != base || s.NewSession().BasePath != base {
 		t.Fatal("changed listener root")
 	}
@@ -55,5 +65,59 @@ func TestSelectRootConfinementAndSessionIsolation(t *testing.T) {
 	}
 	if err := session.SelectRoot(".", nil); err == nil {
 		t.Fatal("changed root after Hello")
+	}
+}
+
+func TestServerRootHandleLifetime(t *testing.T) {
+	s := NewServer()
+	s.BasePath = t.TempDir()
+	if err := s.PinRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PinRoot(); err == nil {
+		t.Fatal("pinned source root twice")
+	}
+	root := s.root
+	if _, err := root.Stat(); err != nil {
+		t.Fatalf("pinned root is closed: %v", err)
+	}
+	session := s.NewSession()
+	authenticateTestSession(t, session)
+	if err := session.SelectRoot(".", nil); err != nil {
+		t.Fatal(err)
+	}
+	selected := session.root
+	s.CloseFiles()
+	if _, err := root.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("listener root remains open: %v", err)
+	}
+	if _, err := selected.Stat(); err != nil {
+		t.Fatalf("session root closed with listener: %v", err)
+	}
+	session.CloseFiles()
+	if _, err := selected.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("session root remains open: %v", err)
+	}
+}
+
+func TestPinRootRejectsNonDirectoryAndSymlink(t *testing.T) {
+	base := t.TempDir()
+	file := filepath.Join(base, "file")
+	if err := os.WriteFile(file, []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(base, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{file, link, filepath.Join(base, "missing")} {
+		s := NewServer()
+		s.BasePath = path
+		if err := s.PinRoot(); err == nil {
+			t.Fatalf("accepted invalid source root %q", path)
+		}
+		if s.root != nil {
+			t.Fatalf("pinned invalid source root %q", path)
+		}
 	}
 }

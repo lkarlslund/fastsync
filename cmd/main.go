@@ -146,6 +146,10 @@ func main() {
 			fastsyncserver := fastsync.NewServer()
 			fastsyncserver.ConfigurePassword(password)
 			fastsyncserver.BasePath = directory
+			if err := fastsyncserver.PinRoot(); err != nil {
+				fastsync.Logger.Fatal().Err(err).Msg("Cannot open source root")
+			}
+			defer fastsyncserver.CloseFiles()
 			if err := fastsyncserver.ConfigureMetadata(serverMetadata); err != nil {
 				fastsync.Logger.Fatal().Err(err).Msg("Invalid metadata limit")
 			}

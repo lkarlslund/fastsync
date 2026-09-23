@@ -101,7 +101,7 @@ func TestAuthenticationGatesAndReplay(t *testing.T) {
 	}
 }
 func TestCompatibilityVersions(t *testing.T) {
-	for _, v := range []VersionInfo{{}, {1, BEHAVIORVERSION}, {PROTOCOLVERSION, 0}, {PROTOCOLVERSION, BEHAVIORVERSION + 1}, {PROTOCOLVERSION + 1, BEHAVIORVERSION}} {
+	for _, v := range []VersionInfo{{}, {1, BEHAVIORVERSION}, {PROTOCOLVERSION - 1, BEHAVIORVERSION}, {PROTOCOLVERSION, 0}, {PROTOCOLVERSION, BEHAVIORVERSION - 1}, {PROTOCOLVERSION, BEHAVIORVERSION + 1}, {PROTOCOLVERSION + 1, BEHAVIORVERSION}} {
 		s := NewServer()
 		authenticateTestSession(t, s)
 		if err := s.Hello(SharedOptions{ProtocolVersion: v.ProtocolVersion, BehaviorVersion: v.BehaviorVersion}, &VersionInfo{}); err == nil {
