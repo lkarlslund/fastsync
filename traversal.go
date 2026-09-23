@@ -86,6 +86,14 @@ func (c *Client) walkAlphabetical(client *rpc.Client, root FileInfo) {
 		}
 		entries := result.response.Files
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+		if item.Name == root.Name {
+			entries, result.err = c.selectTopLevel(entries)
+			if result.err != nil {
+				c.recordError("select source entries: %v", result.err)
+				c.ProcessedItemInDir(item.Name)
+				continue
+			}
+		}
 		var extras []string
 		if c.Delete && !c.warming {
 			names := make(map[string]bool, len(entries))

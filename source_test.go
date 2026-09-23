@@ -11,16 +11,24 @@ import (
 func TestSelectedSourceCopyAndVerify(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
 	writeTestFile(t, src, "server-a/old/data", "archive")
+	writeTestFile(t, src, "server-a/new/data", "not selected")
 	writeTestFile(t, src, "other/data", "other server")
-	runTestSync(t, src, dst, func(c *Client) { c.SourcePath = "server-a" })
+	runTestSync(t, src, dst, func(c *Client) {
+		c.SourcePath = "server-a"
+		c.Include = []string{"old"}
+	})
 	if got := readTestFile(t, dst, "old/data"); got != "archive" {
 		t.Fatal(got)
 	}
 	if _, err := os.Stat(filepath.Join(dst, "other")); !os.IsNotExist(err) {
 		t.Fatal("copied sibling")
 	}
+	if _, err := os.Stat(filepath.Join(dst, "new")); !os.IsNotExist(err) {
+		t.Fatal("copied excluded child")
+	}
 	c := newTestClient(dst)
 	c.SourcePath = "server-a"
+	c.Include = []string{"old"}
 	var report bytes.Buffer
 	if err := c.Verify(newTestRPCClient(t, src), &report); err != nil {
 		t.Fatal(err)

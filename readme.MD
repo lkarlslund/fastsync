@@ -93,6 +93,11 @@ A server can expose a parent backup directory while each client selects one
 server with `client HOST:PORT --source server-a --directory /archive/server-a`.
 Use the same `--source server-a` for `verify`. Selection is connection-scoped,
 confined to the exposed root, and requires a server supporting SelectRoot.
+Repeat `--include NAME_OR_GLOB` to select direct children of that source; a
+matched directory is copied or verified recursively. With no `--include`, the
+whole selected source is processed. Use the same patterns for copy and verify.
+Every pattern must match at least one source entry, and `--include` cannot be
+combined with `--delete`.
 
 `scripts/archive-loop.py CONFIG.json` copies and verifies a fixed list of
 servers sequentially, preserving hardlinks and xattrs. It inherits the terminal
@@ -138,7 +143,7 @@ active intermediary. Continue using an SSH tunnel on untrusted networks. An
 authenticated peer can read the served tree and request shutdown; there are no
 per-user roles. Protect the credential file accordingly.
 
-Both endpoints must match **protocol version 4 and behavior version 4** exactly.
+Both endpoints must match **protocol version 6 and behavior version 6** exactly.
 The client checks the server's versions before authentication/source selection;
 the server checks the client's versions before enabling access. Legacy peers,
 missing versions, and mismatches fail without a downgrade. Both binaries must

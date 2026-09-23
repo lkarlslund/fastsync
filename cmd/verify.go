@@ -18,6 +18,7 @@ import (
 
 func newVerifyCommand() *cobra.Command {
 	var report, sourcePath string
+	var includes []string
 	var attrs, hardlinks bool
 	command := &cobra.Command{
 		Use: "verify server:port", Short: "Read-only archive verification with a JSON-lines report", Args: cobra.ExactArgs(1),
@@ -70,12 +71,14 @@ func newVerifyCommand() *cobra.Command {
 			client.Password = password
 			client.BasePath = directory
 			client.SourcePath = sourcePath
+			client.Include = includes
 			client.Options.SendXattr = attrs
 			client.PreserveHardlinks = hardlinks
 			return client.Verify(rpcClient, output)
 		},
 	}
 	command.Flags().StringVar(&sourcePath, "source", "", "Subdirectory of the remote server root")
+	command.Flags().StringArrayVar(&includes, "include", nil, "Top-level source name or glob to verify recursively (repeatable)")
 	command.Flags().StringVar(&report, "report", "", "Save JSON-lines report outside archive (default stdout)")
 	command.Flags().BoolVar(&attrs, "xattr", true, "Verify extended attributes")
 	command.Flags().BoolVar(&hardlinks, "hardlinks", true, "Verify hardlink relationships")

@@ -82,6 +82,12 @@ func (c *Client) Verify(client *rpc.Client, report io.Writer) error {
 			if err := client.Call("Server.List", remote.Name, &listing); err != nil {
 				return fail(remote.Name, err)
 			}
+			if remote.Name == "/" {
+				listing.Files, err = c.selectTopLevel(listing.Files)
+				if err != nil {
+					return fail(remote.Name, err)
+				}
+			}
 			for _, entry := range listing.Files {
 				if err := walk(entry); err != nil {
 					return err

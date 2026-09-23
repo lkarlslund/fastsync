@@ -43,6 +43,7 @@ type Client struct {
 	shutdownRequested           atomic.Bool
 	BasePath                    string
 	SourcePath                  string
+	Include                     []string
 
 	FlushInterval       time.Duration
 	writtenTotal        atomic.Uint64
@@ -232,6 +233,9 @@ func (c *Client) Run(client *rpc.Client) (runErr error) {
 }
 
 func (c *Client) validateQueueSettings() error {
+	if err := c.validateIncludes(); err != nil {
+		return err
+	}
 	if c.ParallelDir < 1 {
 		return fmt.Errorf("ParallelDir must be at least 1, got %d", c.ParallelDir)
 	}

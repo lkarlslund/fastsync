@@ -211,6 +211,7 @@ func main() {
 		transferblocksize int
 	)
 	var sourcePath string
+	var includes []string
 	var resumeCache, resumeIdentity string
 	var resumePosition bool
 	var pipeline, autoTune bool
@@ -252,6 +253,7 @@ func main() {
 			c.CachedFiles = cachedFiles
 			c.BufferBytes = bufferBytes
 			c.SourcePath = sourcePath
+			c.Include = includes
 			c.PreserveHardlinks = hardlinks
 			c.ParallelDir = paralleldir
 			c.ParallelFile = parallelfile
@@ -404,6 +406,7 @@ func main() {
 	clientCmd.Flags().IntVar(&cachedFiles, "cached-files", 64, "Maximum admitted streaming files, including files awaiting writes")
 	clientCmd.Flags().Int64Var(&bufferBytes, "buffer-bytes", 128*1024*1024, "Payload buffer reservation budget; excludes kernel cache and other process memory")
 	clientCmd.Flags().StringVar(&sourcePath, "source", "", "Subdirectory of the remote server root")
+	clientCmd.Flags().StringArrayVar(&includes, "include", nil, "Top-level source name or glob to copy recursively (repeatable; incompatible with --delete)")
 	clientCmd.Flags().BoolVar(&durable, "durable", false, "Flush each copied file and parent directory to stable storage (slower)")
 	clientCmd.Flags().BoolVar(&hardlinks, "hardlinks", true, "Preserve hardlinks")
 	clientCmd.Flags().BoolVar(&xattr, "xattr", true, "Transfer xattrs")
