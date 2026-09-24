@@ -68,6 +68,12 @@ Telemetry is optional: older servers, unsupported platforms, and stale responses
 
 ## Options and resource use
 
+`--log-file PATH` appends newline-delimited JSON events to a regular file while
+keeping the normal terminal output or interactive dashboard. The file is
+created owner-only (mode 0600), and symlink paths are rejected. `--loglevel`
+controls both destinations. The option does not record dashboard frames or
+transfer statistics; it records FastSync log events.
+
 - `--pfile` defaults to 64 file workers; `--pdir` defaults to 8 concurrent directory listing requests; `--queuesize` defaults to 1024 pending files.
 - `--blocksize` defaults to 64 KiB in the CLI and accepts at most 16 MiB.
 - `--hardlinks` and `--xattr` default to true for both copy and verification.

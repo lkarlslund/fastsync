@@ -37,17 +37,19 @@ func interactiveTerminal() bool {
 }
 
 func configureConsoleLogger(level zerolog.Level, noColor bool) {
-	fastsync.Logger = zerolog.New(zerolog.ConsoleWriter{
+	fastsync.Logger = loggerWithFile(level, zerolog.ConsoleWriter{
 		Out:        os.Stderr,
 		TimeFormat: time.RFC3339,
 		NoColor:    noColor,
-	}).With().Timestamp().Logger().Level(level)
+	}, logFile)
 }
 
 var (
 	// General/root options
 	directory        string
 	loglevel         string
+	logFilePath      string
+	logFile          *os.File
 	cpuprofile       string
 	cpuprofilelength int
 	ramlimit         uint64
@@ -75,6 +77,13 @@ func main() {
 				zll = zerolog.ErrorLevel
 			default:
 				fastsync.Logger.Fatal().Msgf("Invalid log level: %v", loglevel)
+			}
+			if logFilePath != "" {
+				var err error
+				logFile, err = openLogFile(logFilePath)
+				if err != nil {
+					fastsync.Logger.Fatal().Err(err).Msg("Cannot open log file")
+				}
 			}
 			configureConsoleLogger(zll, !term.IsTerminal(int(os.Stderr.Fd())))
 			if ramlimit > 0 {
@@ -126,6 +135,7 @@ func main() {
 	rootCmd.PersistentFlags().StringVar(&passwordFile, "password-file", "", "Owner-only file containing the shared password (server/client/verify/shutdown)")
 	rootCmd.PersistentFlags().StringVar(&directory, "directory", ".", "Directory to use as source or target")
 	rootCmd.PersistentFlags().StringVar(&loglevel, "loglevel", "info", "Log level")
+	rootCmd.PersistentFlags().StringVar(&logFilePath, "log-file", "", "Append newline-delimited JSON events to this file (created owner-only)")
 	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "Write cpu profile to file (filename, use 'auto' to trigger auto profiling)")
 	rootCmd.PersistentFlags().IntVar(&cpuprofilelength, "cpuprofilelength", 0, "Stop profiling after N seconds, 0 to profile until program terminates")
 	rootCmd.PersistentFlags().Uint64Var(&ramlimit, "ramlimit", 0, "Abort with nonzero exit when sampled process memory exceeds this many bytes (0 disables)")
@@ -285,7 +295,7 @@ func main() {
 					<-tuiDone
 					tuiDone = nil
 				} else {
-					fastsync.Logger = zerolog.New(dashboard.logWriter).With().Timestamp().Logger().Level(clientLogLevel)
+					fastsync.Logger = loggerWithFile(clientLogLevel, dashboard.logWriter, logFile)
 					dashboardActive = true
 				}
 			}
@@ -458,7 +468,18 @@ func main() {
 	}
 
 	rootCmd.AddCommand(serverCmd, clientCmd, shutdownCmd, newVerifyCommand())
-	if err := rootCmd.Execute(); err != nil {
+	execErr := rootCmd.Execute()
+	if logFile != nil {
+		if err := logFile.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "sync log file: %v\n", err)
+			execErr = errors.Join(execErr, err)
+		}
+		if err := logFile.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close log file: %v\n", err)
+			execErr = errors.Join(execErr, err)
+		}
+	}
+	if execErr != nil {
 		os.Exit(1)
 	}
 }
