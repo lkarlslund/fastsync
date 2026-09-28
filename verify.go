@@ -69,7 +69,11 @@ func (c *Client) Verify(client *rpc.Client, report io.Writer) error {
 		if err != nil {
 			return fail(remote.Name, err)
 		}
-		if err := compareMetadata(local, remote, c.Options.SendXattr); err != nil {
+		metadataLocal := local
+		if c.selectedRoot(remote) {
+			metadataLocal.Mtim = remote.Mtim
+		}
+		if err := compareMetadata(metadataLocal, remote, c.Options.SendXattr); err != nil {
 			if err := fail(remote.Name, err); err != nil {
 				return err
 			}
@@ -93,7 +97,7 @@ func (c *Client) Verify(client *rpc.Client, report io.Writer) error {
 					return err
 				}
 			}
-			if err := checkRemote(client, remote); err != nil {
+			if err := c.checkDirectory(client, remote); err != nil {
 				return fail(remote.Name, err)
 			}
 			summary.Directories++

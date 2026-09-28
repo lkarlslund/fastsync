@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"net/rpc"
+	"path/filepath"
 	"testing"
 )
 
@@ -109,6 +110,20 @@ func TestCompatibilityVersions(t *testing.T) {
 		}
 		if s.clientsaidhello.Load() {
 			t.Fatal("mismatch enabled archive RPCs")
+		}
+	}
+}
+
+func TestSelectedRootBehaviorRejectsEarlierEndpoints(t *testing.T) {
+	for _, version := range []int{6, 7} {
+		s := NewServer()
+		s.BasePath = filepath.Join(t.TempDir(), "missing-archive")
+		authenticateTestSession(t, s)
+		if err := s.Hello(SharedOptions{ProtocolVersion: version, BehaviorVersion: version}, &VersionInfo{}); err == nil {
+			t.Fatalf("accepted version %d without selected-root stability semantics", version)
+		}
+		if err := s.Stat("/", &FileInfo{}); !errors.Is(err, ErrPleaseSayHello) {
+			t.Fatalf("version %d enabled archive access: %v", version, err)
 		}
 	}
 }

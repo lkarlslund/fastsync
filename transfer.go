@@ -273,6 +273,27 @@ func sameRemoteState(before, after FileInfo) bool {
 		before.LinkTo == after.LinkTo && before.Nlink == after.Nlink
 }
 
+func (c *Client) selectedRoot(info FileInfo) bool {
+	return len(c.Include) > 0 && info.Name == "/" && info.IsDir
+}
+
+func (c *Client) checkDirectory(client *rpc.Client, before FileInfo) error {
+	if !c.selectedRoot(before) {
+		return checkRemote(client, before)
+	}
+	var after FileInfo
+	if err := client.Call("Server.Stat", before.Name, &after); err != nil {
+		return err
+	}
+	// The parent contains excluded siblings. Their creation/deletion cannot
+	// invalidate the selected children, which are checked independently.
+	before.Size, before.Mtim, before.Ctim, before.Nlink = after.Size, after.Mtim, after.Ctim, after.Nlink
+	if !sameRemoteState(before, after) || compareMetadata(after, before, c.Options.SendXattr) != nil {
+		return fmt.Errorf("source changed during operation: %s", before.Name)
+	}
+	return nil
+}
+
 func publishHardlink(source, path string, durable bool) error {
 	a, err := lstatNoFollow(source)
 	if err != nil {

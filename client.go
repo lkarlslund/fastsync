@@ -286,7 +286,7 @@ func (c *Client) ProcessedItemInDir(path string) {
 }
 
 func (c *Client) PostProcessDir(item *dirinfo) {
-	if err := checkRemote(c.remoteClient, item.info); err != nil {
+	if err := c.checkDirectory(c.remoteClient, item.info); err != nil {
 		c.recordError("%s: %v", item.name, err)
 		return
 	}

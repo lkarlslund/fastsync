@@ -3,10 +3,74 @@ package fastsync
 import (
 	"bytes"
 	"errors"
+	"net/rpc"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
+
+type siblingChangingServer struct {
+	*Server
+	rootLists atomic.Int64
+}
+
+func (s *siblingChangingServer) List(path string, reply *FileListResponse) error {
+	if path == "/" && s.rootLists.Add(1) == 2 {
+		if err := os.Mkdir(filepath.Join(s.BasePath, "excluded-new"), 0755); err != nil {
+			return err
+		}
+	}
+	return s.Server.List(path, reply)
+}
+
+func TestIncludedCopyAndVerifyIgnoreExcludedSiblingTimestamps(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	writeTestFile(t, src, "selected/data", "stable archive")
+	server := &siblingChangingServer{Server: NewServer()}
+	server.BasePath = src
+	t.Cleanup(server.CloseFiles)
+	registry := rpc.NewServer()
+	registerTestRPCServer(t, registry, server)
+	c := newTestClient(dst)
+	c.PreserveHardlinks = true
+	c.Include = []string{"selected"}
+	if err := c.Run(newTestRPCClientForServer(t, registry)); err != nil {
+		t.Fatalf("excluded sibling creation failed copy: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "excluded-new")); !os.IsNotExist(err) {
+		t.Fatal("copied excluded sibling")
+	}
+	if err := os.Mkdir(filepath.Join(src, "excluded-later"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	verify := func() error {
+		client := newTestClient(dst)
+		client.Include = c.Include
+		var report bytes.Buffer
+		return client.Verify(newTestRPCClient(t, src), &report)
+	}
+	if err := verify(); err != nil {
+		t.Fatalf("excluded sibling creation failed verification: %v", err)
+	}
+	original, err := os.Stat(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(src, original.Mode().Perm()^0100); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify(); err == nil {
+		t.Fatal("ignored source-root permission mismatch")
+	}
+	if err := os.Chmod(src, original.Mode().Perm()); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, src, "selected/new-data", "must be verified")
+	if err := verify(); err == nil {
+		t.Fatal("ignored mutation inside selected directory")
+	}
+}
 
 func TestSelectedSourceCopyAndVerify(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()

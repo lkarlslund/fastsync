@@ -104,6 +104,10 @@ matched directory is copied or verified recursively. With no `--include`, the
 whole selected source is processed. Use the same patterns for copy and verify.
 Every pattern must match at least one source entry, and `--include` cannot be
 combined with `--delete`.
+For an include selection, parent-directory timestamps and link counts are not
+completion criteria: excluded siblings may be created or deleted independently.
+Parent identity, permissions, ownership and xattrs are still checked, and all
+selected directories retain strict metadata and stability checks.
 
 `scripts/archive-loop.py CONFIG.json` copies and verifies a fixed list of
 servers sequentially, preserving hardlinks and xattrs. It inherits the terminal
@@ -149,7 +153,7 @@ active intermediary. Continue using an SSH tunnel on untrusted networks. An
 authenticated peer can read the served tree and request shutdown; there are no
 per-user roles. Protect the credential file accordingly.
 
-Both endpoints must match **protocol version 7 and behavior version 7** exactly.
+Both endpoints must match **protocol version 8 and behavior version 8** exactly.
 The client checks the server's versions before authentication/source selection;
 the server checks the client's versions before enabling access. Legacy peers,
 missing versions, and mismatches fail without a downgrade. Both binaries must
