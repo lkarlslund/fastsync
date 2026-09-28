@@ -35,6 +35,7 @@ type verifiedInode struct {
 	local      inodeKey
 	path, hash string
 	ctime      syscall.Timespec
+	sourceTime syscall.Timespec
 }
 
 func (c *Client) Verify(client *rpc.Client, report io.Writer) error {
@@ -106,6 +107,7 @@ func (c *Client) Verify(client *rpc.Client, report io.Writer) error {
 		record := VerificationRecord{Type: "file", Path: remote.Name}
 		remoteKey, localKey := inodeKey{remote.Dev, remote.Inode}, inodeKey{local.Dev, local.Inode}
 		already := false
+		rehash := false
 		if c.PreserveHardlinks {
 			if local.Nlink > 1 {
 				if source, found := destInodes[localKey]; found && source != remoteKey {
@@ -127,6 +129,7 @@ func (c *Client) Verify(client *rpc.Client, report io.Writer) error {
 						}
 					}
 					already = true
+					rehash = canonical.sourceTime != remote.Ctim
 					record.SHA256 = canonical.hash
 					record.HardlinkTo = canonical.path
 				}
@@ -148,11 +151,18 @@ func (c *Client) Verify(client *rpc.Client, report io.Writer) error {
 			}
 			record.SHA256 = sourceHash
 		}
-		if err := checkRemote(client, remote); err != nil {
+		sourceTime, err := c.checkVerifiedFile(client, remote, record.SHA256, rehash)
+		if err != nil {
 			return fail(remote.Name, err)
 		}
-		if c.PreserveHardlinks && remote.Nlink > 1 && !already {
-			sourceInodes[remoteKey] = verifiedInode{local: localKey, path: remote.Name, hash: record.SHA256, ctime: local.Ctim}
+		if c.PreserveHardlinks && remote.Nlink > 1 {
+			if already {
+				canonical := sourceInodes[remoteKey]
+				canonical.sourceTime = sourceTime
+				sourceInodes[remoteKey] = canonical
+			} else {
+				sourceInodes[remoteKey] = verifiedInode{local: localKey, path: remote.Name, hash: record.SHA256, ctime: local.Ctim, sourceTime: sourceTime}
+			}
 		}
 		summary.Files++
 		return encoder.Encode(record)
@@ -178,6 +188,33 @@ func (c *Client) Verify(client *rpc.Client, report io.Writer) error {
 		return fmt.Errorf("verification failed with %d error(s): %w", summary.Errors, firstError)
 	}
 	return nil
+}
+
+func (c *Client) checkVerifiedFile(client *rpc.Client, before FileInfo, expectedHash string, rehash bool) (syscall.Timespec, error) {
+	var current FileInfo
+	if err := client.Call("Server.Stat", before.Name, &current); err != nil {
+		return syscall.Timespec{}, err
+	}
+	if sameRemoteState(before, current) && !rehash {
+		return current.Ctim, nil
+	}
+	// Other hardlinks can change ctime. Rehash rather than certifying a stale
+	// digest, including when the change happened between selected generations.
+	if expectedHash == "" || !current.Mode.IsRegular() || current.Dev != before.Dev || current.Inode != before.Inode ||
+		current.Mode != before.Mode || compareMetadata(current, before, c.Options.SendXattr) != nil {
+		return syscall.Timespec{}, fmt.Errorf("source changed during operation: %s", before.Name)
+	}
+	var freshHash string
+	if err := client.Call("Server.Hash", current.Name, &freshHash); err != nil {
+		return syscall.Timespec{}, err
+	}
+	if freshHash != expectedHash {
+		return syscall.Timespec{}, fmt.Errorf("source content changed during verification: %s", before.Name)
+	}
+	if err := checkRemote(client, current); err != nil {
+		return syscall.Timespec{}, err
+	}
+	return current.Ctim, nil
 }
 
 func compareMetadata(local, remote FileInfo, attrs bool) error {

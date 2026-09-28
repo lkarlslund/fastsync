@@ -10,8 +10,8 @@ import (
 
 // Any protocol or transfer-behavior change requires a protocol bump (AGENTS.md).
 // Behavioral changes also bump BEHAVIORVERSION. Pure UI fixes need neither.
-const PROTOCOLVERSION = 8
-const BEHAVIORVERSION = 8
+const PROTOCOLVERSION = 9
+const BEHAVIORVERSION = 9
 
 type SharedOptions struct {
 	ProtocolVersion int
