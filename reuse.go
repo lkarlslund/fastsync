@@ -107,7 +107,8 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 // mutation or replaced destination must fail rather than publish stale data.
 func (c *Client) validateReuseSeed(client *rpc.Client, entry *inodeinfo) error {
 	seed := entry.seed
-	if err := checkRemote(client, seed.source); err != nil {
+	var current FileInfo
+	if err := client.Call("Server.Stat", seed.source.Name, &current); err != nil {
 		return err
 	}
 	local, err := c.localFileInfo(entry.localhardlinkpath)
@@ -116,6 +117,37 @@ func (c *Client) validateReuseSeed(client *rpc.Client, entry *inodeinfo) error {
 	}
 	before := seed.local
 	if local.Dev != before.Dev || local.Inode != before.Inode || local.Size != before.Size || local.Mtim != before.Mtim || local.LinkTo != before.LinkTo || local.Rdev != before.Rdev || compareMetadata(local, seed.source, c.Options.SendXattr) != nil {
+		return fmt.Errorf("cached destination changed: %s", entry.localhardlinkpath)
+	}
+	if sameRemoteState(seed.source, current) {
+		return nil
+	}
+	// Adding/removing other hardlinks changes ctime without changing file data.
+	// Only revalidate regular files, with stable identity/metadata and fresh hashes.
+	if !current.Mode.IsRegular() || current.Dev != seed.source.Dev || current.Inode != seed.source.Inode ||
+		current.Mode != seed.source.Mode || compareMetadata(current, seed.source, c.Options.SendXattr) != nil {
+		return fmt.Errorf("source changed during operation: %s", seed.source.Name)
+	}
+	var sourceHash string
+	if err := client.Call("Server.Hash", current.Name, &sourceHash); err != nil {
+		return err
+	}
+	localHash, err := hashFile(entry.localhardlinkpath)
+	if err != nil {
+		return err
+	}
+	if sourceHash != localHash {
+		return fmt.Errorf("cached source content changed: %s", seed.source.Name)
+	}
+	if err := checkRemote(client, current); err != nil {
+		return err
+	}
+	local, err = c.localFileInfo(entry.localhardlinkpath)
+	if err != nil {
+		return err
+	}
+	if local.Dev != before.Dev || local.Inode != before.Inode || local.Size != before.Size || local.Mtim != before.Mtim ||
+		local.LinkTo != before.LinkTo || local.Rdev != before.Rdev || compareMetadata(local, current, c.Options.SendXattr) != nil {
 		return fmt.Errorf("cached destination changed: %s", entry.localhardlinkpath)
 	}
 	return nil

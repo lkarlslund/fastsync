@@ -261,12 +261,16 @@ func checkRemote(client *rpc.Client, before FileInfo) error {
 	if err := client.Call("Server.Stat", before.Name, &after); err != nil {
 		return err
 	}
-	if before.Dev != after.Dev || before.Inode != after.Inode || before.Size != after.Size ||
-		before.Mtim != after.Mtim || before.Ctim != after.Ctim || before.Mode != after.Mode ||
-		before.LinkTo != after.LinkTo || before.Nlink != after.Nlink {
+	if !sameRemoteState(before, after) {
 		return fmt.Errorf("source changed during operation: %s", before.Name)
 	}
 	return nil
+}
+
+func sameRemoteState(before, after FileInfo) bool {
+	return before.Dev == after.Dev && before.Inode == after.Inode && before.Size == after.Size &&
+		before.Mtim == after.Mtim && before.Ctim == after.Ctim && before.Mode == after.Mode &&
+		before.LinkTo == after.LinkTo && before.Nlink == after.Nlink
 }
 
 func publishHardlink(source, path string, durable bool) error {
