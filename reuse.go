@@ -6,9 +6,24 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 )
 
-type reuseSeed struct{ source, local FileInfo }
+type reuseSeed struct {
+	source FileInfo
+	local  struct {
+		Dev, Inode uint64
+		Size       int64
+		Mtim       syscall.Timespec
+		LinkTo     string
+		Rdev       uint64
+	}
+}
+
+func (s *reuseSeed) sameLocal(local FileInfo) bool {
+	return local.Dev == s.local.Dev && local.Inode == s.local.Inode && local.Size == s.local.Size &&
+		local.Mtim == s.local.Mtim && local.LinkTo == s.local.LinkTo && local.Rdev == s.local.Rdev
+}
 
 // No missing-file inventory: the second walk rediscovers deferred paths.
 // Only the existing source-inode cache survives the pass barrier.
@@ -98,7 +113,10 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 		c.Perf.Add(ReuseGroups, 1)
 	}
 	entry.localhardlinkpath = path
-	entry.seed = &reuseSeed{source: remote, local: local}
+	entry.seed = &reuseSeed{source: remote}
+	entry.seed.local.Dev, entry.seed.local.Inode = local.Dev, local.Inode
+	entry.seed.local.Size, entry.seed.local.Mtim = local.Size, local.Mtim
+	entry.seed.local.LinkTo, entry.seed.local.Rdev = local.LinkTo, local.Rdev
 	c.saveResumeHint(remote)
 	return nil
 }
@@ -115,8 +133,7 @@ func (c *Client) validateReuseSeed(client *rpc.Client, entry *inodeinfo) error {
 	if err != nil {
 		return err
 	}
-	before := seed.local
-	if local.Dev != before.Dev || local.Inode != before.Inode || local.Size != before.Size || local.Mtim != before.Mtim || local.LinkTo != before.LinkTo || local.Rdev != before.Rdev || compareMetadata(local, seed.source, c.Options.SendXattr) != nil {
+	if !seed.sameLocal(local) || compareMetadata(local, seed.source, c.Options.SendXattr) != nil {
 		return fmt.Errorf("cached destination changed: %s", entry.localhardlinkpath)
 	}
 	if sameRemoteState(seed.source, current) {
@@ -146,8 +163,7 @@ func (c *Client) validateReuseSeed(client *rpc.Client, entry *inodeinfo) error {
 	if err != nil {
 		return err
 	}
-	if local.Dev != before.Dev || local.Inode != before.Inode || local.Size != before.Size || local.Mtim != before.Mtim ||
-		local.LinkTo != before.LinkTo || local.Rdev != before.Rdev || compareMetadata(local, current, c.Options.SendXattr) != nil {
+	if !seed.sameLocal(local) || compareMetadata(local, current, c.Options.SendXattr) != nil {
 		return fmt.Errorf("cached destination changed: %s", entry.localhardlinkpath)
 	}
 	return nil
