@@ -261,7 +261,7 @@ func checkRemote(client *rpc.Client, before FileInfo) error {
 	if err := client.Call("Server.Stat", before.Name, &after); err != nil {
 		return err
 	}
-	if !sameRemoteState(before, after) {
+	if !sameRemoteState(before, after) && !sameSymlinkState(before, after) {
 		return fmt.Errorf("source changed during operation: %s", before.Name)
 	}
 	return nil
@@ -271,6 +271,16 @@ func sameRemoteState(before, after FileInfo) bool {
 	return before.Dev == after.Dev && before.Inode == after.Inode && before.Size == after.Size &&
 		before.Mtim == after.Mtim && before.Ctim == after.Ctim && before.Mode == after.Mode &&
 		before.LinkTo == after.LinkTo && before.Nlink == after.Nlink
+}
+
+func sameSymlinkState(before, after FileInfo) bool {
+	if before.Mode&os.ModeSymlink == 0 || after.Mode&os.ModeSymlink == 0 {
+		return false
+	}
+	// A symlink target cannot change in place. Other hardlinks can change its
+	// ctime/link count, but identity, target and archive metadata must still match.
+	before.Ctim, before.Nlink = after.Ctim, after.Nlink
+	return sameRemoteState(before, after) && compareMetadata(after, before, true) == nil
 }
 
 func (c *Client) selectedRoot(info FileInfo) bool {

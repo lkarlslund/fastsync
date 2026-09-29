@@ -114,13 +114,13 @@ func TestCompatibilityVersions(t *testing.T) {
 	}
 }
 
-func TestLiveSourceVerificationRejectsEarlierEndpoints(t *testing.T) {
-	for _, version := range []int{6, 7, 8} {
+func TestLiveSourceSymlinkBehaviorRejectsEarlierEndpoints(t *testing.T) {
+	for _, version := range []int{6, 7, 8, 9} {
 		s := NewServer()
 		s.BasePath = filepath.Join(t.TempDir(), "missing-archive")
 		authenticateTestSession(t, s)
 		if err := s.Hello(SharedOptions{ProtocolVersion: version, BehaviorVersion: version}, &VersionInfo{}); err == nil {
-			t.Fatalf("accepted version %d without live-source verification semantics", version)
+			t.Fatalf("accepted version %d without live-source symlink semantics", version)
 		}
 		if err := s.Stat("/", &FileInfo{}); !errors.Is(err, ErrPleaseSayHello) {
 			t.Fatalf("version %d enabled archive access: %v", version, err)

@@ -136,7 +136,7 @@ func (c *Client) validateReuseSeed(client *rpc.Client, entry *inodeinfo) error {
 	if !seed.sameLocal(local) || compareMetadata(local, seed.source, c.Options.SendXattr) != nil {
 		return fmt.Errorf("cached destination changed: %s", entry.localhardlinkpath)
 	}
-	if sameRemoteState(seed.source, current) {
+	if sameRemoteState(seed.source, current) || sameSymlinkState(seed.source, current) {
 		return nil
 	}
 	// Adding/removing other hardlinks changes ctime without changing file data.

@@ -195,7 +195,7 @@ func (c *Client) checkVerifiedFile(client *rpc.Client, before FileInfo, expected
 	if err := client.Call("Server.Stat", before.Name, &current); err != nil {
 		return syscall.Timespec{}, err
 	}
-	if sameRemoteState(before, current) && !rehash {
+	if (sameRemoteState(before, current) && !rehash) || sameSymlinkState(before, current) {
 		return current.Ctim, nil
 	}
 	// Other hardlinks can change ctime. Rehash rather than certifying a stale
