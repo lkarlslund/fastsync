@@ -280,7 +280,7 @@ func sameSymlinkState(before, after FileInfo) bool {
 	// A symlink target cannot change in place. Other hardlinks can change its
 	// ctime/link count, but identity, target and archive metadata must still match.
 	before.Ctim, before.Nlink = after.Ctim, after.Nlink
-	return sameRemoteState(before, after) && compareMetadata(after, before, true) == nil
+	return sameRemoteState(before, after) && len(before.Xattrs) == len(after.Xattrs) && compareMetadata(after, before, true) == nil
 }
 
 func (c *Client) selectedRoot(info FileInfo) bool {

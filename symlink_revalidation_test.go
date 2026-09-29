@@ -50,6 +50,11 @@ func TestSymlinkStateAllowsOnlyLinkMetadataChanges(t *testing.T) {
 	if sameSymlinkState(regular, regular) {
 		t.Fatal("relaxed regular-file content checks")
 	}
+	withoutAttrs := before
+	withoutAttrs.Xattrs = nil
+	if sameSymlinkState(withoutAttrs, before) || sameSymlinkState(before, withoutAttrs) {
+		t.Fatal("accepted adding or removing all symlink xattrs")
+	}
 }
 
 func makeSymlinkArchive(t *testing.T) (string, string) {

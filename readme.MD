@@ -153,7 +153,7 @@ active intermediary. Continue using an SSH tunnel on untrusted networks. An
 authenticated peer can read the served tree and request shutdown; there are no
 per-user roles. Protect the credential file accordingly.
 
-Both endpoints must match **protocol version 10 and behavior version 10** exactly.
+Both endpoints must match **protocol version 11 and behavior version 11** exactly.
 The client checks the server's versions before authentication/source selection;
 the server checks the client's versions before enabling access. Legacy peers,
 missing versions, and mismatches fail without a downgrade. Both binaries must
