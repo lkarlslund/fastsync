@@ -37,7 +37,7 @@ func (c *Client) syncFile(client *rpc.Client, remote FileInfo) (err error) {
 			if entry.err != nil {
 				return fmt.Errorf("hardlink source failed: %w", entry.err)
 			}
-			if err := checkRemote(client, remote); err != nil {
+			if err := c.checkCopiedFile(client, remote, entry.localhardlinkpath); err != nil {
 				return err
 			}
 			return c.timeMetadata(func() error { return publishHardlink(entry.localhardlinkpath, path, c.Durable) })
@@ -75,7 +75,7 @@ func (c *Client) syncIndependentDispatch(client *rpc.Client, remote FileInfo, pa
 		if !sameContent {
 			return data(func() error { return c.stageRegular(client, remote, path, local, exists) })
 		}
-		if err := checkRemote(client, remote); err != nil {
+		if err := c.checkCopiedFile(client, remote, path); err != nil {
 			return err
 		}
 		metadataChanged := compareMetadata(local, remote, c.Options.SendXattr) != nil
@@ -224,7 +224,7 @@ func (c *Client) stageRegular(client *rpc.Client, remote FileInfo, path string, 
 			offset += length
 		}
 	}
-	if err = checkRemote(client, remote); err != nil {
+	if err = c.checkCopiedFile(client, remote, stage.Name()); err != nil {
 		return err
 	}
 	err = client.Call("Server.Close", remote.Name, nil)
@@ -271,6 +271,42 @@ func sameRemoteState(before, after FileInfo) bool {
 	return before.Dev == after.Dev && before.Inode == after.Inode && before.Size == after.Size &&
 		before.Mtim == after.Mtim && before.Ctim == after.Ctim && before.Mode == after.Mode &&
 		before.LinkTo == after.LinkTo && before.Nlink == after.Nlink
+}
+
+// Revalidate only ctime/link-count drift against the actual data being reused
+// or published. The usual unchanged path does not read file contents.
+func (c *Client) checkCopiedFile(client *rpc.Client, before FileInfo, path string) error {
+	var current FileInfo
+	if err := client.Call("Server.Stat", before.Name, &current); err != nil {
+		return err
+	}
+	if sameRemoteState(before, current) || sameSymlinkState(before, current) {
+		return nil
+	}
+	if !sameRegularMetadata(before, current, c.Options.SendXattr) {
+		return fmt.Errorf("source changed during operation: %s", before.Name)
+	}
+	var sourceHash string
+	if err := client.Call("Server.Hash", current.Name, &sourceHash); err != nil {
+		return err
+	}
+	localHash, err := hashFile(path)
+	if err != nil {
+		return err
+	}
+	if sourceHash != localHash {
+		return fmt.Errorf("source content changed during operation: %s", before.Name)
+	}
+	return checkRemote(client, current)
+}
+
+func sameRegularMetadata(before, after FileInfo, attrs bool) bool {
+	if !before.Mode.IsRegular() || !after.Mode.IsRegular() {
+		return false
+	}
+	before.Ctim, before.Nlink = after.Ctim, after.Nlink
+	return sameRemoteState(before, after) && (!attrs || len(before.Xattrs) == len(after.Xattrs)) &&
+		compareMetadata(after, before, attrs) == nil
 }
 
 func sameSymlinkState(before, after FileInfo) bool {
@@ -460,7 +496,7 @@ func (c *Client) stageLocal(client *rpc.Client, remote FileInfo, path string) (e
 	if err = c.applyMetadata(local, remote); err != nil {
 		return err
 	}
-	if err = checkRemote(client, remote); err != nil {
+	if err = c.checkCopiedFile(client, remote, stagedPath); err != nil {
 		return err
 	}
 	if c.Durable {

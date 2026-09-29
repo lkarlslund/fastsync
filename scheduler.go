@@ -62,7 +62,7 @@ func (c *Client) scheduleFiles(client *rpc.Client) {
 								break
 							}
 						}
-						err = checkRemote(client, j.remote)
+						err = c.checkCopiedFile(client, j.remote, j.entry.localhardlinkpath)
 						if err == nil {
 							err = c.timeMetadata(func() error {
 								a, e := lstatNoFollow(j.entry.localhardlinkpath)

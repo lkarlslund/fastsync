@@ -93,7 +93,7 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 	} else if local.LinkTo != remote.LinkTo || local.Rdev != remote.Rdev {
 		return nil
 	}
-	if err := checkRemote(client, remote); err != nil {
+	if err := c.checkCopiedFile(client, remote, path); err != nil {
 		return err
 	}
 	// Never let two different source inodes adopt the same destination inode.
@@ -141,8 +141,7 @@ func (c *Client) validateReuseSeed(client *rpc.Client, entry *inodeinfo) error {
 	}
 	// Adding/removing other hardlinks changes ctime without changing file data.
 	// Only revalidate regular files, with stable identity/metadata and fresh hashes.
-	if !current.Mode.IsRegular() || current.Dev != seed.source.Dev || current.Inode != seed.source.Inode ||
-		current.Mode != seed.source.Mode || compareMetadata(current, seed.source, c.Options.SendXattr) != nil {
+	if !sameRegularMetadata(seed.source, current, c.Options.SendXattr) {
 		return fmt.Errorf("source changed during operation: %s", seed.source.Name)
 	}
 	var sourceHash string

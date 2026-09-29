@@ -200,8 +200,7 @@ func (c *Client) checkVerifiedFile(client *rpc.Client, before FileInfo, expected
 	}
 	// Other hardlinks can change ctime. Rehash rather than certifying a stale
 	// digest, including when the change happened between selected generations.
-	if expectedHash == "" || !current.Mode.IsRegular() || current.Dev != before.Dev || current.Inode != before.Inode ||
-		current.Mode != before.Mode || compareMetadata(current, before, c.Options.SendXattr) != nil {
+	if expectedHash == "" || !sameRegularMetadata(before, current, c.Options.SendXattr) {
 		return syscall.Timespec{}, fmt.Errorf("source changed during operation: %s", before.Name)
 	}
 	var freshHash string

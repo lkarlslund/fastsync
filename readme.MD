@@ -37,6 +37,8 @@ fastsync client 127.0.0.1:7331 --directory /archive/SERVER \
 
 Keep the source tree stable throughout copying and verification: use a source snapshot or suspend backup creation/rotation for that server. FastSync checks source identity, size and change timestamps and fails on detected mutations, but these checks do not replace a stable source.
 
+Adding or removing hardlinks outside the selection changes inode ctime and link count without changing archived data. When only those fields change, regular-file copying requires fresh matching source/destination SHA-256 hashes and a stable source check after hashing; symlinks require unchanged identity, target and metadata. Unchanged files still use the normal quick check. Continued mutations during revalidation fail rather than certify an unstable result. This does not make copying a live, changing tree an atomic snapshot.
+
 Copy failures produce a nonzero exit status. Regular-file changes are staged in the destination directory and renamed into place after successful transfer and metadata application. Followers of a hardlink wait for that success. Existing destination hardlinks are separated before replacing independent source files, protecting older versions during reruns.
 
 Rerun a failed copy. `--checksum` forces comparison of existing file contents; otherwise equal size and mtime allow content to be skipped. Metadata is reconciled separately. Correct existing hardlink groups keep their inodes and do not trigger content reads or staging without `--checksum`. With `--checksum`, matching content is checked once per shared source inode and left in place. If a shared inode needs metadata or link-topology repair, a local reflink (or local-copy fallback) separates it without remote checksums or data transfer. Unchanged files do not have access times rewritten. Missing hardlinks are created directly. Matching blocks can be reused from an existing destination file; staged updates still write those blocks locally. An interrupted new file may need retransmission. Abrupt termination or a machine crash can leave `.fastsync-*` staging entries; they are not completed backups. Do not run overlapping clients against the same destination tree.
@@ -153,7 +155,7 @@ active intermediary. Continue using an SSH tunnel on untrusted networks. An
 authenticated peer can read the served tree and request shutdown; there are no
 per-user roles. Protect the credential file accordingly.
 
-Both endpoints must match **protocol version 11 and behavior version 11** exactly.
+Both endpoints must match **protocol version 12 and behavior version 12** exactly.
 The client checks the server's versions before authentication/source selection;
 the server checks the client's versions before enabling access. Legacy peers,
 missing versions, and mismatches fail without a downgrade. Both binaries must
