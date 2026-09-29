@@ -3,6 +3,7 @@ package fastsync
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -130,6 +131,67 @@ func TestWarmPassSkipsMismatchedMember(t *testing.T) {
 	c := runTestSync(t, src, dst, func(c *Client) { c.PreserveHardlinks = true })
 	if c.Perf.Get(WrittenBytes) != 0 {
 		t.Fatal("copied despite good later member")
+	}
+	if _, err := verifyTestArchive(t, src, dst); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompleteGenerationsNeedFullScopeForHardlinkRepair(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	writeTestFile(t, src, "a/file", "shared data")
+	fixedFileTime(t, filepath.Join(src, "a/file"))
+	for _, generation := range []string{"b", "c"} {
+		if err := os.Mkdir(filepath.Join(src, generation), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(filepath.Join(src, "a/file"), filepath.Join(src, generation, "file")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, generation := range []string{"a", "b", "c"} {
+		writeTestFile(t, dst, generation+"/file", "shared data")
+		fixedFileTime(t, filepath.Join(dst, generation, "file"))
+		for _, root := range []string{src, dst} {
+			fixedFileTime(t, filepath.Join(root, generation))
+		}
+	}
+	canonical, err := os.Stat(filepath.Join(dst, "a/file"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runTestSync(t, src, dst, func(c *Client) {
+		c.PreserveHardlinks = true
+		c.Include = []string{"a", "c"}
+	})
+	for _, generation := range []string{"a", "b", "c"} {
+		source, err := os.Stat(filepath.Join(src, generation))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dest, err := os.Stat(filepath.Join(dst, generation))
+		if err != nil || !dest.ModTime().Equal(source.ModTime()) {
+			t.Fatalf("generation %s does not have its completion timestamp: %v", generation, err)
+		}
+	}
+	report, err := verifyTestArchive(t, src, dst)
+	if err == nil || !strings.Contains(report, "source hardlink relationship missing at destination") {
+		t.Fatalf("certified incomplete cross-generation links: error=%v, report=%s", err, report)
+	}
+	client, server := resumeSync(t, src, dst, false)
+	if client.Perf.Get(ReadBytes) != 0 || client.Perf.Get(WrittenBytes) != 0 ||
+		client.Perf.Get(TransferredFileBytes) != 0 || server.opens.Load() != 0 ||
+		server.checks.Load() != 0 || server.chunks.Load() != 0 {
+		t.Fatal("hardlink repair read, transferred or rewrote file data")
+	}
+	if client.Perf.Get(FilesLinked) != 1 {
+		t.Fatalf("linked %d files, want only the excluded generation", client.Perf.Get(FilesLinked))
+	}
+	for _, generation := range []string{"a", "b", "c"} {
+		current, err := os.Stat(filepath.Join(dst, generation, "file"))
+		if err != nil || !os.SameFile(canonical, current) {
+			t.Fatalf("generation %s did not reuse the canonical inode: %v", generation, err)
+		}
 	}
 	if _, err := verifyTestArchive(t, src, dst); err != nil {
 		t.Fatal(err)
