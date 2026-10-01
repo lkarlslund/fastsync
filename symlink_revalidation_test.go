@@ -40,19 +40,19 @@ func TestSymlinkStateAllowsOnlyLinkMetadataChanges(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			after := before
 			tc.change(&after)
-			if got := sameSymlinkState(before, after); got != tc.ok {
+			if got := sameStableNonRegularState(before, after); got != tc.ok {
 				t.Fatalf("accepted=%v, want %v", got, tc.ok)
 			}
 		})
 	}
 	regular := before
 	regular.Mode = 0644
-	if sameSymlinkState(regular, regular) {
+	if sameStableNonRegularState(regular, regular) {
 		t.Fatal("relaxed regular-file content checks")
 	}
 	withoutAttrs := before
 	withoutAttrs.Xattrs = nil
-	if sameSymlinkState(withoutAttrs, before) || sameSymlinkState(before, withoutAttrs) {
+	if sameStableNonRegularState(withoutAttrs, before) || sameStableNonRegularState(before, withoutAttrs) {
 		t.Fatal("accepted adding or removing all symlink xattrs")
 	}
 }

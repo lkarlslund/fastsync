@@ -261,7 +261,7 @@ func checkRemote(client *rpc.Client, before FileInfo) error {
 	if err := client.Call("Server.Stat", before.Name, &after); err != nil {
 		return err
 	}
-	if !sameRemoteState(before, after) && !sameSymlinkState(before, after) {
+	if !sameRemoteState(before, after) && !sameStableNonRegularState(before, after) {
 		return fmt.Errorf("source changed during operation: %s", before.Name)
 	}
 	return nil
@@ -280,7 +280,7 @@ func (c *Client) checkCopiedFile(client *rpc.Client, before FileInfo, path strin
 	if err := client.Call("Server.Stat", before.Name, &current); err != nil {
 		return err
 	}
-	if sameRemoteState(before, current) || sameSymlinkState(before, current) {
+	if sameRemoteState(before, current) || sameStableNonRegularState(before, current) {
 		return nil
 	}
 	if !sameRegularMetadata(before, current, c.Options.SendXattr) {
@@ -309,12 +309,14 @@ func sameRegularMetadata(before, after FileInfo, attrs bool) bool {
 		compareMetadata(after, before, attrs) == nil
 }
 
-func sameSymlinkState(before, after FileInfo) bool {
-	if before.Mode&os.ModeSymlink == 0 || after.Mode&os.ModeSymlink == 0 {
+func sameStableNonRegularState(before, after FileInfo) bool {
+	switch before.Mode & os.ModeType {
+	case os.ModeSymlink, os.ModeSocket, os.ModeNamedPipe, os.ModeDevice, os.ModeDevice | os.ModeCharDevice:
+	default:
 		return false
 	}
-	// A symlink target cannot change in place. Other hardlinks can change its
-	// ctime/link count, but identity, target and archive metadata must still match.
+	// These entries have no file data. Other hardlinks can change ctime/link
+	// count, but identity and all transferable metadata must still match.
 	before.Ctim, before.Nlink = after.Ctim, after.Nlink
 	return sameRemoteState(before, after) && len(before.Xattrs) == len(after.Xattrs) && compareMetadata(after, before, true) == nil
 }

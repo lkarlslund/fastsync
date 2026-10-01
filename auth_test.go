@@ -115,7 +115,7 @@ func TestCompatibilityVersions(t *testing.T) {
 }
 
 func TestLiveSourceCopyBehaviorRejectsEarlierEndpoints(t *testing.T) {
-	for _, version := range []int{6, 7, 8, 9, 10, 11} {
+	for _, version := range []int{6, 7, 8, 9, 10, 11, 12} {
 		s := NewServer()
 		s.BasePath = filepath.Join(t.TempDir(), "missing-archive")
 		authenticateTestSession(t, s)
