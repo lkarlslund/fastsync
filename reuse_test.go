@@ -156,14 +156,18 @@ func TestCompleteGenerationsNeedFullScopeForHardlinkRepair(t *testing.T) {
 			fixedFileTime(t, filepath.Join(root, generation))
 		}
 	}
-	canonical, err := os.Stat(filepath.Join(dst, "a/file"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	runTestSync(t, src, dst, func(c *Client) {
 		c.PreserveHardlinks = true
 		c.Include = []string{"a", "c"}
 	})
+	canonical, err := os.Stat(filepath.Join(dst, "a/file"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected, err := os.Stat(filepath.Join(dst, "c/file"))
+	if err != nil || !os.SameFile(canonical, selected) {
+		t.Fatalf("selected generations are not hardlinked: %v", err)
+	}
 	for _, generation := range []string{"a", "b", "c"} {
 		source, err := os.Stat(filepath.Join(src, generation))
 		if err != nil {
