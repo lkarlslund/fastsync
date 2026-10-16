@@ -92,7 +92,7 @@ func (c *Client) scheduleFiles(client *rpc.Client) {
 						}
 						// Directory finalization can perform RPC and metadata IO;
 						// never block the dispatcher on it.
-						c.ProcessedItemInDir(filepath.Dir(j.remote.Name))
+						c.processedItemInDir(filepath.Dir(j.remote.Name), err != nil)
 					}
 					done <- fileCompletion{j, stage, err}
 				}

@@ -222,6 +222,8 @@ func main() {
 	)
 	var sourcePath string
 	var includes []string
+	var references []string
+	var completionStamps bool
 	var resumeCache, resumeIdentity string
 	var resumePosition bool
 	var pipeline, autoTune bool
@@ -264,6 +266,8 @@ func main() {
 			c.BufferBytes = bufferBytes
 			c.SourcePath = sourcePath
 			c.Include = includes
+			c.Reference = references
+			c.CompletionStamps = completionStamps
 			c.PreserveHardlinks = hardlinks
 			c.ParallelDir = paralleldir
 			c.ParallelFile = parallelfile
@@ -417,6 +421,8 @@ func main() {
 	clientCmd.Flags().Int64Var(&bufferBytes, "buffer-bytes", 128*1024*1024, "Payload buffer reservation budget; excludes kernel cache and other process memory")
 	clientCmd.Flags().StringVar(&sourcePath, "source", "", "Subdirectory of the remote server root")
 	clientCmd.Flags().StringArrayVar(&includes, "include", nil, "Top-level source name or glob to copy recursively (repeatable; incompatible with --delete)")
+	clientCmd.Flags().StringArrayVar(&references, "reference", nil, "Completed top-level directory to scan once for read-only hardlink seeds (repeatable; requires --include)")
+	clientCmd.Flags().BoolVar(&completionStamps, "completion-stamps", false, "Invalidate top-level directory mtimes before writing; restore them only after durable subtree completion (Linux)")
 	clientCmd.Flags().BoolVar(&durable, "durable", false, "Flush each copied file and parent directory to stable storage (slower)")
 	clientCmd.Flags().BoolVar(&hardlinks, "hardlinks", true, "Preserve hardlinks")
 	clientCmd.Flags().BoolVar(&xattr, "xattr", true, "Transfer xattrs")

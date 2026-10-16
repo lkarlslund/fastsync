@@ -28,6 +28,21 @@ func (s *reuseSeed) sameLocal(local FileInfo) bool {
 // No missing-file inventory: the second walk rediscovers deferred paths.
 // Only the existing source-inode cache survives the pass barrier.
 func (c *Client) warmExistingPass(client *rpc.Client, root FileInfo) {
+	if len(c.Reference) > 0 {
+		c.warmingReferences = true
+		c.warmExistingWalk(client, root)
+		c.warmingReferences = false
+		if c.runError() != nil {
+			return
+		}
+		c.queueMu.Lock()
+		c.filequeue = make(chan FileInfo, c.QueueSize)
+		c.queueMu.Unlock()
+	}
+	c.warmExistingWalk(client, root)
+}
+
+func (c *Client) warmExistingWalk(client *rpc.Client, root FileInfo) {
 	var workers sync.WaitGroup
 	for i := 0; i < c.ParallelFile; i++ {
 		workers.Add(1)
@@ -64,6 +79,9 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 	path := filepath.Join(c.BasePath, remote.Name)
 	local, err := c.localFileInfo(path)
 	if os.IsNotExist(err) {
+		if c.isReference(remote.Name) {
+			return fmt.Errorf("reference seed missing: %s", remote.Name)
+		}
 		return nil
 	}
 	if err != nil {
@@ -73,6 +91,9 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 		remote.Xattrs = nil
 	}
 	if local.Mode&os.ModeType != remote.Mode&os.ModeType || compareMetadata(local, remote, c.Options.SendXattr) != nil {
+		if c.isReference(remote.Name) {
+			return fmt.Errorf("reference seed metadata mismatch: %s", remote.Name)
+		}
 		return nil
 	}
 	if remote.Mode.IsRegular() {
@@ -93,11 +114,18 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 	} else if local.LinkTo != remote.LinkTo || local.Rdev != remote.Rdev {
 		return nil
 	}
-	if err := c.checkCopiedFile(client, remote, path); err != nil {
-		return err
+	// Reference candidates are revalidated on first use, so unused groups need
+	// no Stat RPC. They remain read-only throughout this invocation.
+	if !c.isReference(remote.Name) {
+		if err := c.checkCopiedFile(client, remote, path); err != nil {
+			return err
+		}
 	}
 	// Never let two different source inodes adopt the same destination inode.
 	if c.conflictingLocalInode(local, remote) {
+		if c.isReference(remote.Name) {
+			return fmt.Errorf("reference links independent source inodes: %s", remote.Name)
+		}
 		return nil
 	}
 	c.inodesMu.Lock()

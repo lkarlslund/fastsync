@@ -30,6 +30,7 @@ type dirinfo struct {
 	info         FileInfo
 	extraentries []string // files/folders that are local only, and should be deleted
 	remaining    int64
+	failed       bool
 }
 
 type Client struct {
@@ -39,11 +40,14 @@ type Client struct {
 	Password                    string // Local only; never serialized or logged.
 	reuseLocks                  [256]sync.Mutex
 	warming                     bool // changed only between joined passes
+	warmingReferences           bool
 	phase                       atomic.Int32
 	shutdownRequested           atomic.Bool
 	BasePath                    string
 	SourcePath                  string
 	Include                     []string
+	Reference                   []string
+	CompletionStamps            bool
 
 	FlushInterval       time.Duration
 	writtenTotal        atomic.Uint64
@@ -203,6 +207,9 @@ func (c *Client) Run(client *rpc.Client) (runErr error) {
 		Logger.Info().Msg("Pass 1: checking existing paths and warming hardlink cache")
 		c.warmExistingPass(client, rootdirinfo)
 		c.warming = false
+		if len(c.Reference) > 0 && c.runError() != nil {
+			return c.runError()
+		}
 		if cache != nil {
 			cache.publish(c.runError() == nil)
 		}
@@ -236,6 +243,12 @@ func (c *Client) validateQueueSettings() error {
 	if err := c.validateIncludes(); err != nil {
 		return err
 	}
+	if c.CompletionStamps && c.FlushInterval <= 0 {
+		return fmt.Errorf("completion-stamps requires background file flushing")
+	}
+	if c.CompletionStamps && !completionStampsSupported {
+		return fmt.Errorf("completion-stamps is only supported on Linux")
+	}
 	if c.ParallelDir < 1 {
 		return fmt.Errorf("ParallelDir must be at least 1, got %d", c.ParallelDir)
 	}
@@ -255,6 +268,10 @@ func (c *Client) validateQueueSettings() error {
 }
 
 func (c *Client) ProcessedItemInDir(path string) {
+	c.processedItemInDir(path, false)
+}
+
+func (c *Client) processedItemInDir(path string, failed bool) {
 	if c.warming {
 		return
 	}
@@ -264,6 +281,7 @@ func (c *Client) ProcessedItemInDir(path string) {
 	c.dircacheMu.Lock()
 	if item, found := c.dircache[path]; found {
 		founddirectory = true
+		item.failed = item.failed || failed
 		item.remaining--
 		left := item.remaining
 		Logger.Trace().Msgf("directory %s has usage %v left", item.name, left)
@@ -278,30 +296,41 @@ func (c *Client) ProcessedItemInDir(path string) {
 		c.recordError("Failed to find directory info for postprocessing %s", path)
 	}
 	if donewithdirectory {
-		c.PostProcessDir(&doneitem)
+		ok := c.postProcessDir(&doneitem)
 		if path != "/" {
-			c.ProcessedItemInDir(filepath.Dir(path))
+			c.processedItemInDir(filepath.Dir(path), !ok)
 		}
 	}
 }
 
 func (c *Client) PostProcessDir(item *dirinfo) {
+	c.postProcessDir(item)
+}
+
+func (c *Client) postProcessDir(item *dirinfo) bool {
+	if item.failed || (!c.CompletionStamps && c.runError() != nil) {
+		return false
+	}
 	if err := c.checkDirectory(c.remoteClient, item.info); err != nil {
 		c.recordError("%s: %v", item.name, err)
-		return
-	}
-	if c.runError() != nil {
-		return
+		return false
 	}
 	if c.Delete {
 		for _, extraentry := range item.extraentries {
 			err := removeAllNoFollow(filepath.Join(c.BasePath, item.name, extraentry))
 			if err != nil {
 				c.recordError("Error unlinking %v: %v", filepath.Join(c.BasePath, item.name, extraentry), err)
+				return false
 			}
 			if err == nil {
 				c.Perf.Add(EntriesDeleted, 1)
 			}
+		}
+	}
+	if c.CompletionStamps && topLevelDirectory(item.info) {
+		if err := c.flushCompletionDirectory(item); err != nil {
+			c.recordError("flush completed directory %s: %v", item.name, err)
+			return false
 		}
 	}
 
@@ -309,12 +338,23 @@ func (c *Client) PostProcessDir(item *dirinfo) {
 	localdirfi, err := c.localFileInfo(filepath.Join(c.BasePath, item.name))
 	if err != nil {
 		c.recordError("Problem getting local directory information for %v: %v", filepath.Join(c.BasePath, item.name), err)
+		return false
 	} else {
 		if err := c.applyMetadata(localdirfi, item.info); err != nil {
 			c.recordError("Problem applying directory metadata for %v: %v", filepath.Join(c.BasePath, item.name), err)
+			return false
 		}
 	}
+	if c.CompletionStamps && topLevelDirectory(item.info) {
+		if err := syncCompletionStamp(filepath.Join(c.BasePath, item.name)); err != nil {
+			_ = c.invalidateCompletionStamp(item.info)
+			c.recordError("persist completion stamp %s: %v", item.name, err)
+			return false
+		}
+		Logger.Info().Str("path", item.name).Msg("Directory durably complete")
+	}
 	c.checkpointResumeDirectory(item)
+	return true
 }
 
 func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
