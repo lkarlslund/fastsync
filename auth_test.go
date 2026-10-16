@@ -115,12 +115,12 @@ func TestCompatibilityVersions(t *testing.T) {
 }
 
 func TestLiveSourceCopyBehaviorRejectsEarlierEndpoints(t *testing.T) {
-	for _, version := range []int{6, 7, 8, 9, 10, 11, 12, 13} {
+	for _, version := range []int{6, 7, 8, 9, 10, 11, 12, 13, 14} {
 		s := NewServer()
 		s.BasePath = filepath.Join(t.TempDir(), "missing-archive")
 		authenticateTestSession(t, s)
 		if err := s.Hello(SharedOptions{ProtocolVersion: version, BehaviorVersion: version}, &VersionInfo{}); err == nil {
-			t.Fatalf("accepted version %d without live-source copy revalidation", version)
+			t.Fatalf("accepted incompatible transfer version %d", version)
 		}
 		if err := s.Stat("/", &FileInfo{}); !errors.Is(err, ErrPleaseSayHello) {
 			t.Fatalf("version %d enabled archive access: %v", version, err)

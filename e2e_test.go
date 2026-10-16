@@ -82,7 +82,7 @@ func newTestRPCClientForServer(t *testing.T, rpcServer *rpc.Server) *rpc.Client 
 	var h codec.MsgpackHandle
 	client := rpc.NewClientWithCodec(codec.GoRpc.ClientCodec(CompressedReadWriteCloser(conn), &h))
 	t.Cleanup(func() {
-		if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+		if err := client.Close(); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, rpc.ErrShutdown) {
 			t.Errorf("close rpc client: %v", err)
 		}
 	})

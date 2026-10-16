@@ -70,13 +70,20 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 	lock := &c.reuseLocks[(remote.Dev^remote.Inode)%uint64(len(c.reuseLocks))]
 	lock.Lock()
 	defer lock.Unlock()
-	c.inodesMu.Lock()
-	cached := c.inodes[key] != nil
-	c.inodesMu.Unlock()
-	if cached {
-		return nil
-	}
 	path := filepath.Join(c.BasePath, remote.Name)
+	c.inodesMu.Lock()
+	cachedPath, cacheErr := c.inodePathLocked(key)
+	c.inodesMu.Unlock()
+	if cacheErr != nil {
+		_ = client.Close()
+		return cacheErr
+	}
+	if cachedPath != "" {
+		rel, _ := filepath.Rel(c.BasePath, cachedPath)
+		if cachedPath <= path || (!c.warmingReferences && c.isReference(rel)) {
+			return nil
+		}
+	}
 	local, err := c.localFileInfo(path)
 	if os.IsNotExist(err) {
 		if c.isReference(remote.Name) {
@@ -101,8 +108,25 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 			return nil
 		}
 		if c.AlwaysChecksum {
-			match, err := c.contentMatches(client, remote, path)
+			match := false
+			// An earlier pathname of the same validated local inode can become
+			// canonical without hashing that data again.
+			if cachedPath != "" {
+				c.inodesMu.Lock()
+				entry := c.inodes[key]
+				if entry == nil && c.inodeStore != nil {
+					entry, err = c.inodeStore.load(key)
+				}
+				if err == nil && entry != nil && entry.seed != nil {
+					match = entry.seed.sameLocal(local) && sameRemoteState(entry.seed.source, remote)
+				}
+				c.inodesMu.Unlock()
+			}
+			if err == nil && !match {
+				match, err = c.contentMatches(client, remote, path)
+			}
 			if err != nil {
+				_ = client.Close()
 				return err
 			}
 			if !match {
@@ -122,7 +146,11 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 		}
 	}
 	// Never let two different source inodes adopt the same destination inode.
-	if c.conflictingLocalInode(local, remote) {
+	conflict, err := c.conflictingLocalInode(local, remote)
+	if err != nil {
+		return err
+	}
+	if conflict {
 		if c.isReference(remote.Name) {
 			return fmt.Errorf("reference links independent source inodes: %s", remote.Name)
 		}
@@ -131,6 +159,18 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 	c.inodesMu.Lock()
 	defer c.inodesMu.Unlock()
 	entry := c.inodes[key]
+	if entry == nil && c.inodeStore != nil {
+		var err error
+		entry, err = c.inodeStore.load(key)
+		if err != nil {
+			_ = client.Close()
+			return err
+		}
+		if entry != nil {
+			c.inodes[key] = entry
+			c.residentDisk++
+		}
+	}
 	if entry != nil && entry.localhardlinkpath <= path {
 		return nil
 	}
@@ -146,6 +186,10 @@ func (c *Client) warmExistingFile(client *rpc.Client, remote FileInfo) error {
 	entry.seed.local.Size, entry.seed.local.Mtim = local.Size, local.Mtim
 	entry.seed.local.LinkTo, entry.seed.local.Rdev = local.LinkTo, local.Rdev
 	c.saveResumeHint(remote)
+	if err := c.idleInodeLocked(key, entry); err != nil {
+		_ = client.Close()
+		return err
+	}
 	return nil
 }
 
@@ -193,5 +237,6 @@ func (c *Client) validateReuseSeed(client *rpc.Client, entry *inodeinfo) error {
 	if !seed.sameLocal(local) || compareMetadata(local, current, c.Options.SendXattr) != nil {
 		return fmt.Errorf("cached destination changed: %s", entry.localhardlinkpath)
 	}
+	seed.source = current
 	return nil
 }

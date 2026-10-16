@@ -15,6 +15,7 @@ require (
 
 require (
 	github.com/mum4k/termdash v0.22.0
+	go.etcd.io/bbolt v1.4.3
 	golang.org/x/term v0.37.0
 )
 

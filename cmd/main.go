@@ -224,6 +224,8 @@ func main() {
 	var includes []string
 	var references []string
 	var completionStamps bool
+	var inodeSpillDirectory string
+	var inodeMemoryGroups int
 	var resumeCache, resumeIdentity string
 	var resumePosition bool
 	var pipeline, autoTune bool
@@ -268,6 +270,8 @@ func main() {
 			c.Include = includes
 			c.Reference = references
 			c.CompletionStamps = completionStamps
+			c.InodeSpillDirectory = inodeSpillDirectory
+			c.InodeMemoryGroups = inodeMemoryGroups
 			c.PreserveHardlinks = hardlinks
 			c.ParallelDir = paralleldir
 			c.ParallelFile = parallelfile
@@ -423,6 +427,8 @@ func main() {
 	clientCmd.Flags().StringArrayVar(&includes, "include", nil, "Top-level source name or glob to copy recursively (repeatable; incompatible with --delete)")
 	clientCmd.Flags().StringArrayVar(&references, "reference", nil, "Completed top-level directory to scan once for read-only hardlink seeds (repeatable; requires --include)")
 	clientCmd.Flags().BoolVar(&completionStamps, "completion-stamps", false, "Invalidate top-level directory mtimes before writing; restore them only after durable subtree completion (Linux)")
+	clientCmd.Flags().StringVar(&inodeSpillDirectory, "inode-spill-directory", "", "Directory outside the destination for a temporary disk-backed hardlink index")
+	clientCmd.Flags().IntVar(&inodeMemoryGroups, "inode-memory-groups", 100000, "Maximum idle hardlink groups in memory when disk spilling is enabled")
 	clientCmd.Flags().BoolVar(&durable, "durable", false, "Flush each copied file and parent directory to stable storage (slower)")
 	clientCmd.Flags().BoolVar(&hardlinks, "hardlinks", true, "Preserve hardlinks")
 	clientCmd.Flags().BoolVar(&xattr, "xattr", true, "Transfer xattrs")

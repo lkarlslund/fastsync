@@ -1,6 +1,7 @@
 package fastsync
 
 import (
+	"container/list"
 	"errors"
 	"fmt"
 	"net/rpc"
@@ -15,14 +16,17 @@ type inodeKey struct {
 }
 
 type inodeinfo struct {
-	bytesCounted      bool // owned by the scheduler dispatcher; warmup never counts bytes
-	seed              *reuseSeed
 	seedOnce          sync.Once
+	bytesCounted      bool // owned by the scheduler dispatcher; warmup never counts bytes
+	diskBacked        bool
+	seed              *reuseSeed
 	seedErr           error
 	localhardlinkpath string
 	done              chan struct{}
 	err               error  // published by closing done
 	remaining         uint64 // protected by inodesMu; counts completed paths
+	users             int
+	idle              *list.Element
 }
 
 type dirinfo struct {
@@ -48,6 +52,8 @@ type Client struct {
 	Include                     []string
 	Reference                   []string
 	CompletionStamps            bool
+	InodeSpillDirectory         string
+	InodeMemoryGroups           int
 
 	FlushInterval       time.Duration
 	writtenTotal        atomic.Uint64
@@ -80,10 +86,13 @@ type Client struct {
 
 	fileWorkerWG sync.WaitGroup
 
-	filequeue   chan FileInfo
-	inodesMu    sync.Mutex
-	inodes      map[inodeKey]*inodeinfo
-	localOwners map[inodeKey]inodeKey // shared destination inode -> source inode
+	filequeue    chan FileInfo
+	inodesMu     sync.Mutex
+	inodes       map[inodeKey]*inodeinfo
+	localOwners  map[inodeKey]inodeKey // shared destination inode -> source inode
+	inodeStore   *inodeStore
+	inodeIdle    list.List
+	residentDisk int
 
 	dircacheMu sync.Mutex
 	dircache   map[string]*dirinfo
@@ -116,6 +125,7 @@ func NewClient() *Client {
 		QueueSize:         1024,
 		ParallelDir:       8,
 		PreserveHardlinks: true,
+		InodeMemoryGroups: 100000,
 		BlockSize:         16 * 1024,
 		Options: SharedOptions{
 			ProtocolVersion: PROTOCOLVERSION,
@@ -151,6 +161,8 @@ func (c *Client) Run(client *rpc.Client) (runErr error) {
 	c.inodesMu.Lock()
 	c.inodes = make(map[inodeKey]*inodeinfo)
 	c.localOwners = make(map[inodeKey]inodeKey)
+	c.inodeIdle.Init()
+	c.residentDisk = 0
 	c.inodesMu.Unlock()
 	c.dircacheMu.Lock()
 	c.dircache = make(map[string]*dirinfo)
@@ -187,6 +199,18 @@ func (c *Client) Run(client *rpc.Client) (runErr error) {
 	}
 	if st, err := lstatNoFollow(c.BasePath); err != nil || !st.IsDir() {
 		return fmt.Errorf("destination must be an existing directory: %s", c.BasePath)
+	}
+	if c.InodeSpillDirectory != "" {
+		if err := c.openInodeSpill(); err != nil {
+			return err
+		}
+		defer func() {
+			c.inodesMu.Lock()
+			store := c.inodeStore
+			c.inodeStore = nil
+			c.inodesMu.Unlock()
+			runErr = errors.Join(runErr, store.close())
+		}()
 	}
 	cache, loaded, cacheErr := c.openResumeCache(rootdirinfo)
 	if cacheErr != nil {
@@ -242,6 +266,9 @@ func (c *Client) Run(client *rpc.Client) (runErr error) {
 func (c *Client) validateQueueSettings() error {
 	if err := c.validateIncludes(); err != nil {
 		return err
+	}
+	if c.InodeSpillDirectory != "" && (!c.PreserveHardlinks || c.ResumeCache != "" || c.InodeMemoryGroups < 1) {
+		return fmt.Errorf("inode spill requires hardlinks, a positive memory-group limit, and no resume-cache")
 	}
 	if c.CompletionStamps && c.FlushInterval <= 0 {
 		return fmt.Errorf("completion-stamps requires background file flushing")
@@ -362,6 +389,9 @@ func (c *Client) Stats() (inodes, directories, filequeue, directoriestack int) {
 	defer c.queueMu.Unlock()
 	c.inodesMu.Lock()
 	inodes = len(c.inodes)
+	if c.inodeStore != nil {
+		inodes += c.inodeStore.keys - c.residentDisk
+	}
 	c.inodesMu.Unlock()
 
 	c.dircacheMu.Lock()

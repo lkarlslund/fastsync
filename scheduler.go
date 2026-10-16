@@ -168,12 +168,10 @@ func (c *Client) scheduleFiles(client *rpc.Client) {
 				}
 				delete(waiting, j.entry)
 			}
-			c.inodesMu.Lock()
-			j.entry.remaining--
-			if j.entry.remaining == 0 {
-				delete(c.inodes, inodeKey{j.remote.Dev, j.remote.Inode})
+			if err := c.releaseInode(j.remote, j.entry); err != nil {
+				c.recordError("inode spill %s: %v", j.remote.Name, err)
+				_ = client.Close()
 			}
-			c.inodesMu.Unlock()
 		}
 		pending--
 	}
@@ -204,14 +202,15 @@ func (c *Client) scheduleFiles(client *rpc.Client) {
 			}
 			j := &scheduledFile{remote: remote}
 			if c.PreserveHardlinks && remote.Nlink > 1 {
-				key := inodeKey{remote.Dev, remote.Inode}
-				c.inodesMu.Lock()
-				j.entry, j.follower = c.inodes[key]
-				if !j.follower {
-					j.entry = &inodeinfo{localhardlinkpath: filepath.Join(c.BasePath, remote.Name), done: make(chan struct{}), remaining: remote.Nlink}
-					c.inodes[key] = j.entry
+				var err error
+				j.entry, j.follower, err = c.admitInode(remote)
+				if err != nil {
+					c.recordError("inode spill %s: %v", remote.Name, err)
+					c.processedItemInDir(filepath.Dir(remote.Name), true)
+					pending--
+					_ = client.Close()
+					continue
 				}
-				c.inodesMu.Unlock()
 			}
 			if j.follower {
 				select {

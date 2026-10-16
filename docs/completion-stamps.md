@@ -30,5 +30,25 @@ missing generation while preserving links into a completed generation. Selection
 of retention windows, completed backups, gap anchors and audits belongs in the
 operational planner. These flags do not infer backup policy.
 
-Both protocol and behavior version 14 are required on both endpoints because
-reference traversal, reuse validation and directory completion semantics changed.
+Reference traversal and completion stamps were introduced in protocol/behavior
+version 14. Version 15 also supports temporary disk-backed hardlink indexing and
+revalidates spilled reuse seeds when they are loaded again. Both endpoint versions
+must match exactly.
+
+## Large hardlink histories
+
+`--inode-spill-directory /private/cache --inode-memory-groups 100000` bounds the
+in-memory hardlink dictionary and destination-inode ownership claims. Completed
+idle groups spill to a temporary bbolt database. Active groups remain in memory
+until their queued followers finish, preserving dependency and publication order.
+The index preserves canonical paths, link counters and unique-byte accounting.
+Database errors fail the transfer; entries are never silently dropped.
+
+Use an existing private directory on a fast local filesystem, outside the copied
+tree. The index is removed on normal cleanup. After a crash its old file is not
+loaded or trusted; it may be deleted once no client uses it. Spilling cannot be
+combined with the persistent resume cache. bbolt uses file-backed memory mappings;
+their reclaimable resident pages count toward the CLI's RSS memory guard. Size the
+guard appropriately or use an OS memory limit with a bounded Go heap for large
+spill files. The database is an invocation-local working index, not verification
+or durable completion evidence.

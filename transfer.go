@@ -11,42 +11,6 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
-// A single worker owns each remote inode. Followers wait for successful publication,
-// not merely for the destination pathname to exist.
-func (c *Client) syncFile(client *rpc.Client, remote FileInfo) (err error) {
-	path := filepath.Join(c.BasePath, remote.Name)
-	if c.PreserveHardlinks && remote.Nlink > 1 {
-		key := inodeKey{remote.Dev, remote.Inode}
-		c.inodesMu.Lock()
-		entry, follower := c.inodes[key]
-		if !follower {
-			entry = &inodeinfo{localhardlinkpath: path, done: make(chan struct{}), remaining: remote.Nlink}
-			c.inodes[key] = entry
-		}
-		c.inodesMu.Unlock()
-		defer func() {
-			c.inodesMu.Lock()
-			entry.remaining--
-			if entry.remaining == 0 {
-				delete(c.inodes, key)
-			}
-			c.inodesMu.Unlock()
-		}()
-		if follower {
-			<-entry.done
-			if entry.err != nil {
-				return fmt.Errorf("hardlink source failed: %w", entry.err)
-			}
-			if err := c.checkCopiedFile(client, remote, entry.localhardlinkpath); err != nil {
-				return err
-			}
-			return c.timeMetadata(func() error { return publishHardlink(entry.localhardlinkpath, path, c.Durable) })
-		}
-		defer func() { entry.err = err; close(entry.done) }()
-	}
-	return c.syncIndependent(client, remote, path)
-}
-
 func (c *Client) syncIndependent(client *rpc.Client, remote FileInfo, path string) error {
 	return c.syncIndependentDispatch(client, remote, path, func(work func() error) error { return work() })
 }
@@ -79,7 +43,14 @@ func (c *Client) syncIndependentDispatch(client *rpc.Client, remote FileInfo, pa
 			return err
 		}
 		metadataChanged := compareMetadata(local, remote, c.Options.SendXattr) != nil
-		if local.Nlink > 1 && (metadataChanged || c.conflictingLocalInode(local, remote)) {
+		conflict := false
+		if local.Nlink > 1 && !metadataChanged {
+			conflict, err = c.conflictingLocalInode(local, remote)
+			if err != nil {
+				return err
+			}
+		}
+		if local.Nlink > 1 && (metadataChanged || conflict) {
 			// The content selection policy has already accepted the local data. Detach
 			// without fetching/checksumming it again, and never edit the shared inode.
 			return data(func() error { return c.stageLocal(client, remote, path) })
@@ -98,9 +69,18 @@ func (c *Client) syncIndependentDispatch(client *rpc.Client, remote FileInfo, pa
 			err = f.Sync()
 		}
 		return err
-	} else if !exists || local.Mode&os.ModeType != remote.Mode&os.ModeType ||
-		local.LinkTo != remote.LinkTo || local.Rdev != remote.Rdev ||
-		(local.Nlink > 1 && (compareMetadata(local, remote, c.Options.SendXattr) != nil || c.conflictingLocalInode(local, remote))) {
+	}
+	replace := !exists || local.Mode&os.ModeType != remote.Mode&os.ModeType || local.LinkTo != remote.LinkTo || local.Rdev != remote.Rdev
+	if !replace && local.Nlink > 1 {
+		replace = compareMetadata(local, remote, c.Options.SendXattr) != nil
+		if !replace {
+			replace, err = c.conflictingLocalInode(local, remote)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if replace {
 		tmp, err := mkdirTempNoFollow(filepath.Dir(path), ".fastsync-")
 		if err != nil {
 			return err
@@ -416,7 +396,7 @@ func (c *Client) applyMetadata(local, remote FileInfo) error {
 
 // Separate source inodes must not remain merged at the destination, even when
 // their metadata/content happen to match. Correct source hardlinks share a claim.
-func (c *Client) conflictingLocalInode(local, remote FileInfo) bool {
+func (c *Client) conflictingLocalInode(local, remote FileInfo) (bool, error) {
 	c.inodesMu.Lock()
 	defer c.inodesMu.Unlock()
 	if c.localOwners == nil {
@@ -424,10 +404,31 @@ func (c *Client) conflictingLocalInode(local, remote FileInfo) bool {
 	}
 	localKey, remoteKey := inodeKey{local.Dev, local.Inode}, inodeKey{remote.Dev, remote.Inode}
 	if owner, found := c.localOwners[localKey]; found {
-		return owner != remoteKey
+		return owner != remoteKey, nil
+	}
+	if c.inodeStore != nil {
+		owner, found, err := c.inodeStore.owner(localKey)
+		if err != nil {
+			if c.remoteClient != nil {
+				_ = c.remoteClient.Close()
+			}
+			return false, err
+		}
+		if found {
+			return owner != remoteKey, nil
+		}
 	}
 	c.localOwners[localKey] = remoteKey
-	return false
+	if c.inodeStore != nil && len(c.localOwners) >= c.InodeMemoryGroups {
+		if err := c.inodeStore.putOwners(c.localOwners); err != nil {
+			if c.remoteClient != nil {
+				_ = c.remoteClient.Close()
+			}
+			return false, err
+		}
+		clear(c.localOwners)
+	}
+	return false, nil
 }
 
 func (c *Client) contentMatches(client *rpc.Client, remote FileInfo, path string) (same bool, err error) {
