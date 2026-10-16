@@ -3,11 +3,13 @@ package fastsync
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/rs/zerolog"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/rs/zerolog"
 )
 
 func cachedSync(t *testing.T, src, dst, path, id string) *Client {
@@ -21,12 +23,32 @@ func TestPersistentCacheSkipsWarmTraversalAndReuses(t *testing.T) {
 	if first.Perf.Get(WrittenBytes) != 0 {
 		t.Fatal("initial reuse wrote data")
 	}
+	data, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var hints uint64
+	for {
+		var record resumeRecord
+		if err := decoder.Decode(&record); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if record.Hint != nil {
+			hints++
+		}
+	}
+	if hints == 0 {
+		t.Fatal("journal has no reusable hints")
+	}
 	if err := os.Remove(filepath.Join(dst, "a/file")); err != nil {
 		t.Fatal(err)
 	}
 	second := cachedSync(t, src, dst, cache, "synthetic-snapshot")
-	if second.Perf.Get(ExistingExamined) != 1 {
-		t.Fatalf("expected one hint validation, got %d", second.Perf.Get(ExistingExamined))
+	if second.Perf.Get(ExistingExamined) != hints {
+		t.Fatalf("expected %d journal hint validations without traversal, got %d", hints, second.Perf.Get(ExistingExamined))
 	}
 	if second.Perf.Get(WrittenBytes) != 0 || second.Perf.Get(FilesLinked) != 1 {
 		t.Fatal("did not reuse persistent hint")

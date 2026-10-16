@@ -5,26 +5,87 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
+	"unsafe"
 )
 
 type directoryListing struct {
 	response FileListResponse
 	err      error
+	retained int64
+}
+
+func (l *directoryListing) retainedBytes() int64 {
+	n := int64(len(l.response.ParentDirectory)) + int64(cap(l.response.Files))*int64(unsafe.Sizeof(FileInfo{}))
+	for _, file := range l.response.Files {
+		n += int64(len(file.Name) + len(file.LinkTo))
+		if len(file.Xattrs) > 0 {
+			n += 128
+			for key, value := range file.Xattrs {
+				n += int64(64 + len(key) + cap(value))
+			}
+		}
+	}
+	return n
 }
 
 // Alphabetical depth-first admission is independent of RPC completion order.
-// At most ParallelDir sibling listings are prefetched. Their responses remain
-// private until their turn; data copying still runs concurrently downstream.
+// Prefetch the nearest pending directories, without letting completed ancestor
+// siblings occupy the RPC slots. Cached replies have a 64 MiB estimated budget;
+// at most ParallelDir in-flight replies can overshoot it.
 func (c *Client) walkAlphabetical(client *rpc.Client, root FileInfo) {
 	pending := []FileInfo{root}
 	futures := make(map[string]chan directoryListing)
 	slots := make(chan struct{}, c.ParallelDir)
-	fetch := func(item FileInfo) directoryListing {
-		slots <- struct{}{}
-		defer func() { <-slots }()
+	lookAhead := 64 * c.ParallelDir
+	var cachedBytes atomic.Int64
+	fetchAcquired := func(item FileInfo) directoryListing {
 		var result directoryListing
 		result.err = client.Call("Server.List", item.Name, &result.response)
 		return result
+	}
+	prefetch := func(current FileInfo) {
+		for i := len(pending); i >= 0 && len(pending)-i < lookAhead; i-- {
+			if len(futures) >= lookAhead || cachedBytes.Load() >= 64<<20 {
+				return
+			}
+			item := current
+			if i < len(pending) {
+				item = pending[i]
+			}
+			if !item.IsDir {
+				continue
+			}
+			if _, exists := futures[item.Name]; exists {
+				continue
+			}
+			if c.ResumePosition && c.resume != nil {
+				if _, complete := c.resume.subtrees[relativeResumePath(item.Name)]; complete {
+					continue
+				}
+			}
+			select {
+			case slots <- struct{}{}:
+				if c.warming && i < len(pending) {
+					local, err := lstatNoFollow(filepath.Join(c.BasePath, item.Name))
+					if err != nil || !local.IsDir() {
+						<-slots
+						return
+					}
+				}
+				future := make(chan directoryListing, 1)
+				futures[item.Name] = future
+				go func() {
+					defer func() { <-slots }()
+					result := fetchAcquired(item)
+					result.retained = result.retainedBytes()
+					cachedBytes.Add(result.retained)
+					future <- result
+				}()
+			default:
+				return
+			}
+		}
 	}
 	// Every launched request has a buffered result, and is joined even on errors.
 	defer func() {
@@ -85,12 +146,16 @@ func (c *Client) walkAlphabetical(client *rpc.Client, root FileInfo) {
 			c.dircache[item.Name] = &dirinfo{name: item.Name, info: item, remaining: -1}
 			c.dircacheMu.Unlock()
 		}
+		prefetch(item)
 		var result directoryListing
 		if future, ok := futures[item.Name]; ok {
 			result = <-future
+			cachedBytes.Add(-result.retained)
 			delete(futures, item.Name)
 		} else {
-			result = fetch(item)
+			slots <- struct{}{}
+			result = fetchAcquired(item)
+			<-slots
 		}
 		if result.err != nil {
 			c.recordError("list directory %s: %v", item.Name, result.err)
@@ -135,19 +200,6 @@ func (c *Client) walkAlphabetical(client *rpc.Client, root FileInfo) {
 		}
 		if len(entries) == 0 {
 			c.ProcessedItemInDir(item.Name)
-		}
-		// Prefetch in name order, but never enqueue files from these responses here.
-		for _, e := range entries {
-			if e.IsDir && len(futures) < c.ParallelDir {
-				if c.ResumePosition && c.resume != nil {
-					if _, ok := c.resume.subtrees[relativeResumePath(e.Name)]; ok {
-						continue
-					}
-				}
-				future := make(chan directoryListing, 1)
-				futures[e.Name] = future
-				go func(item FileInfo) { future <- fetch(item) }(e)
-			}
 		}
 		for i := len(entries) - 1; i >= 0; i-- {
 			pending = append(pending, entries[i])

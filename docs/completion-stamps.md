@@ -35,6 +35,20 @@ version 14. Version 15 also supports temporary disk-backed hardlink indexing and
 revalidates spilled reuse seeds when they are loaded again. Both endpoint versions
 must match exactly.
 
+Version 16 serializes compressed writes and cancellation. Closing a connection
+aborts outstanding transport I/O before compressor cleanup, avoiding a write/close
+race and ensuring a blocked peer cannot stall shutdown. Completed RPCs are not
+affected; pending calls are canceled.
+
+Version 17 keeps alphabetical admission while rolling directory read-ahead over
+the nearest pending paths. Completed replies for distant ancestor siblings no
+longer prevent parallel listings deeper in a tree. At most the configured
+directory parallelism is in flight. Cached replies have a 64 MiB estimated
+storage budget and a bounded reply count; in-flight replies and the currently
+processed listing are additional. Missing destination subtrees are not listed
+during warm-up. Both protocol and behavior versions were bumped because traversal
+and source access timing changed, even though the RPC encoding did not.
+
 ## Large hardlink histories
 
 `--inode-spill-directory /private/cache --inode-memory-groups 100000` bounds the

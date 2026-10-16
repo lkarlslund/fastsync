@@ -43,7 +43,7 @@ func registerTestRPCServer(t *testing.T, rpcServer *rpc.Server, server any) {
 	}
 }
 
-func newTestRPCClientForServer(t *testing.T, rpcServer *rpc.Server) *rpc.Client {
+func newTestRPCClientForServer(t testing.TB, rpcServer *rpc.Server) *rpc.Client {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

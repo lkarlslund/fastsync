@@ -30,7 +30,13 @@ func TestPositionSavedWhenDisabledAndUsedOnlyWhenEnabled(t *testing.T) {
 func TestPositionMissingDestinationSubtreeIsRevisited(t *testing.T) {
 	src, dst := makeABC(t)
 	cache := filepath.Join(t.TempDir(), "cache")
-	cachedSync(t, src, dst, cache, "synthetic-snapshot")
+	// Keep one surviving canonical hint; stale-hint fallback is a separate case.
+	runTestSync(t, src, dst, func(c *Client) {
+		c.PreserveHardlinks = true
+		c.ResumeCache = cache
+		c.ResumeIdentity = "synthetic-snapshot"
+		c.ParallelFile = 1
+	})
 	if err := os.RemoveAll(filepath.Join(dst, "c")); err != nil {
 		t.Fatal(err)
 	}
