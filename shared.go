@@ -1,6 +1,7 @@
 package fastsync
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -10,8 +11,8 @@ import (
 
 // Any protocol or transfer-behavior change requires a protocol bump (AGENTS.md).
 // Behavioral changes also bump BEHAVIORVERSION. Pure UI fixes need neither.
-const PROTOCOLVERSION = 15
-const BEHAVIORVERSION = 15
+const PROTOCOLVERSION = 16
+const BEHAVIORVERSION = 16
 
 type SharedOptions struct {
 	ProtocolVersion int
@@ -20,19 +21,21 @@ type SharedOptions struct {
 }
 
 type compressedConn struct {
-	r *s2.Reader
-	w *s2.Writer
-	c io.Closer
+	r         *s2.Reader
+	w         *s2.Writer
+	c         io.Closer
+	writeMu   sync.Mutex
+	closing   atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
 }
 
+// CompressedReadWriteCloser wraps an RPC stream. Close aborts pending transport
+// I/O before compressor cleanup; callers must finish their RPCs before closing.
 func CompressedReadWriteCloser(rwc io.ReadWriteCloser) io.ReadWriteCloser {
 	r := s2.NewReader(rwc)
 	w := s2.NewWriter(rwc, s2.WriterFlushOnWrite())
-	return &compressedConn{
-		r,
-		w,
-		rwc,
-	}
+	return &compressedConn{r: r, w: w, c: rwc}
 }
 
 func (c *compressedConn) Read(p []byte) (n int, err error) {
@@ -41,18 +44,25 @@ func (c *compressedConn) Read(p []byte) (n int, err error) {
 }
 
 func (c *compressedConn) Write(p []byte) (n int, err error) {
-	n, err = c.w.Write(p)
-	return
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closing.Load() {
+		return 0, io.ErrClosedPipe
+	}
+	return c.w.Write(p)
 }
 
 func (c *compressedConn) Close() (err error) {
-	if closeErr := c.w.Close(); closeErr != nil {
-		err = closeErr
-	}
-	if closeErr := c.c.Close(); err == nil && closeErr != nil {
-		err = closeErr
-	}
-	return err
+	c.closeOnce.Do(func() {
+		c.closing.Store(true)
+		// S2 may still be writing asynchronously after Write returns. Abort the
+		// transport first so compressor shutdown cannot wait on a blocked peer.
+		transportErr := c.c.Close()
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		c.closeErr = errors.Join(transportErr, c.w.Close())
+	})
+	return c.closeErr
 }
 
 // performance related stuff
